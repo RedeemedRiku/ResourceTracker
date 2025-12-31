@@ -1,0 +1,9 @@
+## Interface: 30300
+## Title: Resource Tracker
+## Notes: Track items and currencies across inventory, bank, and resource bank
+## Author: YourName
+## Version: 1.0
+## SavedVariablesPerCharacter: ResourceTrackerDB
+## SavedVariables: ResourceTrackerAccountDB
+
+ResourceTracker.lua
