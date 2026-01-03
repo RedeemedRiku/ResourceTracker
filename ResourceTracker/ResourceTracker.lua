@@ -3,14 +3,13 @@ local addonName = "ResourceTracker"
 local RT = {}
 _G.ResourceTracker = RT
 
--- Account-wide saved variables (both position and tracked items)
+-- Account-wide saved variables
 ResourceTrackerAccountDB = ResourceTrackerAccountDB or {}
 ResourceTrackerAccountDB.anchorX = ResourceTrackerAccountDB.anchorX or 100
 ResourceTrackerAccountDB.anchorY = ResourceTrackerAccountDB.anchorY or -200
 ResourceTrackerAccountDB.slots = ResourceTrackerAccountDB.slots or {}
 ResourceTrackerAccountDB.isLocked = ResourceTrackerAccountDB.isLocked or false
 ResourceTrackerAccountDB.slotsPerRow = ResourceTrackerAccountDB.slotsPerRow or 4
-
 
 -- Frame references
 local mainFrame
@@ -24,6 +23,25 @@ local optionsDialog
 local SLOT_SIZE = 37
 local SLOT_SPACING = 4
 local TAB_HEIGHT = 24
+local PENDING_TIMEOUT = 10
+local POLLING_TIMEOUT = 10
+local POLLING_INTERVAL = 1.0
+
+-- Saved item counts (to detect changes)
+local savedCounts = {}
+
+-- Item info cache
+local itemCache = {}
+
+-- Session tracking
+local hasLoadedOnce = false
+
+-- Cache API availability (checked once at load)
+local hasResourceBankAPI = false
+
+-- Reusable tables for consolidation (avoid GC pressure)
+local consolidationTemp = {}
+local sortedIndicesTemp = {}
 
 -- Helper function to format numbers
 local function FormatCount(count)
@@ -40,12 +58,24 @@ local function FormatCount(count)
     end
 end
 
--- Get total count of an item across all sources
+-- Cached GetItemInfo
+local function GetCachedItemInfo(id)
+    if not itemCache[id] then
+        local name, link, quality, iLevel, reqLevel, class, subclass, maxStack, equipSlot, texture = GetItemInfo(id)
+        if texture then  -- Only cache if successfully retrieved
+            itemCache[id] = {name, link, quality, iLevel, reqLevel, class, subclass, maxStack, equipSlot, texture}
+        else
+            return nil  -- Not cached yet
+        end
+    end
+    return unpack(itemCache[id])
+end
+
+-- Get total count of an item across all sources (optimized)
 local function GetTotalItemCount(itemId)
-    local total = 0
-    total = GetItemCount(itemId, true)
+    local total = GetItemCount(itemId, true)
     
-    if GetCustomGameData then
+    if hasResourceBankAPI then
         local resourceBankCount = GetCustomGameData(13, itemId)
         if resourceBankCount and type(resourceBankCount) == "number" then
             total = total + resourceBankCount
@@ -59,7 +89,9 @@ end
 local UpdateSlot
 local UpdateAllSlots
 local RebuildSlots
+local UpdateSlotPositions
 local ShowGoalDialog
+local CleanupStaleData
 
 -- Update a single slot's display
 UpdateSlot = function(slotIndex)
@@ -81,8 +113,8 @@ UpdateSlot = function(slotIndex)
     
     slot.plusSign:Hide()
     
-    -- Request item info if not cached
-    local itemName, _, _, _, _, _, _, _, _, texture = GetItemInfo(data.id)
+    -- Request item info using cached version
+    local itemName, _, _, _, _, _, _, _, _, texture = GetCachedItemInfo(data.id)
     
     if not texture then
         -- Item not in cache yet, request it and show loading state
@@ -91,16 +123,19 @@ UpdateSlot = function(slotIndex)
         slot.count:SetText("...")
         slot.goalText:Hide()
         slot.checkMark:Hide()
-        -- Queue this slot for retry
+        -- Queue this slot for retry with timestamp
         if not mainFrame.pendingSlots then
             mainFrame.pendingSlots = {}
         end
-        mainFrame.pendingSlots[slotIndex] = true
+        mainFrame.pendingSlots[slotIndex] = GetTime()
         return
     end
     
     -- Item is cached, display it normally
     local count = GetTotalItemCount(data.id)
+    
+    -- Save the count
+    savedCounts[data.id] = count
     
     slot.icon:SetTexture(texture)
     slot.icon:SetDesaturated(false)
@@ -135,15 +170,29 @@ UpdateAllSlots = function()
     end
 end
 
--- Get number of filled slots
-local function GetFilledSlotCount()
-    local count = 0
-    for i, data in pairs(ResourceTrackerAccountDB.slots) do
-        if data and data.id then
-            count = count + 1
+-- Clean up stale data from memory (optimized single-pass)
+CleanupStaleData = function()
+    -- Single pass: check each saved/polled item against current slots
+    for itemId in pairs(savedCounts) do
+        local isTracked = false
+        for _, data in pairs(ResourceTrackerAccountDB.slots) do
+            if data and data.id == itemId then
+                isTracked = true
+                break
+            end
+        end
+        if not isTracked then
+            savedCounts[itemId] = nil
+            pollingItems[itemId] = nil
         end
     end
-    return count
+    
+    -- Check pollingItems for any that aren't in savedCounts
+    for itemId in pairs(pollingItems) do
+        if not savedCounts[itemId] then
+            pollingItems[itemId] = nil
+        end
+    end
 end
 
 -- Common validation function for item IDs
@@ -152,7 +201,7 @@ local function ValidateItemId(id)
         return false, "|cffff0000Please enter a valid Item ID|r"
     end
     
-    local itemName = GetItemInfo(id)
+    local itemName = GetCachedItemInfo(id)
     if not itemName then
         return false, "|cffff0000Invalid Item ID: " .. id .. "|r"
     end
@@ -166,13 +215,37 @@ local function ValidateItemId(id)
     return true
 end
 
--- Common function to update dialog after validation
+-- Common function to update dialog after validation (optimized - no rebuild)
 local function UpdateDialogAfterValidation(dialog, slotIndex)
+    local itemId = dialog.editBox:GetNumber()
     ResourceTrackerAccountDB.slots[slotIndex] = {
         type = "item",
-        id = dialog.editBox:GetNumber()
+        id = itemId
     }
-    RebuildSlots()
+    
+    -- Only update this specific slot and save its count (no full rebuild)
+    savedCounts[itemId] = GetTotalItemCount(itemId)
+    
+    -- If adding to a new slot position, we may need to add the empty slot after it
+    local filledCount = 0
+    for _, data in pairs(ResourceTrackerAccountDB.slots) do
+        if data and data.id then
+            filledCount = filledCount + 1
+        end
+    end
+    
+    local totalSlots = filledCount + 1
+    if totalSlots > #slots then
+        -- Need to create a new slot
+        slots[totalSlots] = CreateSlot(mainFrame, totalSlots)
+    end
+    
+    -- Reposition slots (lightweight - no count queries)
+    UpdateSlotPositions()
+    
+    -- Update only the new slot
+    UpdateSlot(slotIndex)
+    
     dialog:Hide()
 end
 
@@ -345,6 +418,7 @@ ShowGoalDialog = function(slotIndex)
     goalDialog.editBox:SetFocus()
 end
 
+-- Show options dialog
 local function ShowOptionsDialog()
     if not optionsDialog then
         optionsDialog = CreateFrame("Frame", "RTOptionsDialog", UIParent)
@@ -393,7 +467,8 @@ local function ShowOptionsDialog()
             local value = tonumber(optionsDialog.editBox:GetText())
             if value and value > 0 and value <= 20 then
                 ResourceTrackerAccountDB.slotsPerRow = value
-                RebuildSlots()
+                -- Just reposition, no need to rebuild counts
+                UpdateSlotPositions()
             else
                 print("|cffff0000ResourceTracker: Please enter a number between 1 and 20|r")
             end
@@ -419,10 +494,28 @@ local function ShowOptionsDialog()
     optionsDialog.editBox:SetFocus()
 end
 
+-- Slot OnEnter handler (created once, reused)
+local function Slot_OnEnter(self)
+    mainFrame.tab:Show()
+    local data = ResourceTrackerAccountDB.slots[self.slotIndex]
+    if data and data.id then
+        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+        GameTooltip:SetHyperlink("item:" .. data.id)
+        GameTooltip:Show()
+    end
+end
+
+-- Slot OnLeave handler (created once, reused)
+local function Slot_OnLeave(self)
+    GameTooltip:Hide()
+    mainFrame.tabHideTimer = 0.1
+end
+
 -- Create a slot button
 local function CreateSlot(parent, index)
     local slot = CreateFrame("Button", "RTSlot" .. index, parent)
     slot:SetSize(SLOT_SIZE, SLOT_SIZE)
+    slot.slotIndex = index  -- Store index for tooltip handlers
     
     slot.icon = slot:CreateTexture(nil, "ARTWORK")
     slot.icon:SetAllPoints()
@@ -485,7 +578,13 @@ local function CreateSlot(parent, index)
                     {
                         text = "Clear Slot",
                         func = function()
+                            local clearedItemId = ResourceTrackerAccountDB.slots[index].id
                             ResourceTrackerAccountDB.slots[index] = nil
+                            -- Stop polling this item if it was being polled
+                            if clearedItemId then
+                                pollingItems[clearedItemId] = nil
+                            end
+                            -- Must do full rebuild on slot deletion (consolidation needed)
                             RebuildSlots()
                         end,
                         notCheckable = true
@@ -503,53 +602,42 @@ local function CreateSlot(parent, index)
     
     slot:RegisterForClicks("LeftButtonUp", "RightButtonUp")
     
+    -- Set tooltip handlers once (not recreated on rebuild)
+    slot:SetScript("OnEnter", Slot_OnEnter)
+    slot:SetScript("OnLeave", Slot_OnLeave)
+    
     return slot
 end
 
--- Rebuild all slots based on current data
-RebuildSlots = function()
+-- Lightweight slot repositioning (no count queries)
+UpdateSlotPositions = function()
     if not mainFrame then return end
     
-    for i = 1, #slots do
-        slots[i]:Hide()
-        slots[i]:ClearAllPoints()
-    end
-    
-    local consolidated = {}
-    local sortedIndices = {}
-    
-    for i, data in pairs(ResourceTrackerAccountDB.slots) do
-        if data and data.id then
-            table.insert(sortedIndices, i)
-        end
-    end
-    table.sort(sortedIndices)
-    
-    for newIndex, oldIndex in ipairs(sortedIndices) do
-        consolidated[newIndex] = ResourceTrackerAccountDB.slots[oldIndex]
-    end
-    
-    ResourceTrackerAccountDB.slots = consolidated
-    
+    -- Count filled slots
     local filledCount = 0
-    for i, data in pairs(ResourceTrackerAccountDB.slots) do
+    for _, data in pairs(ResourceTrackerAccountDB.slots) do
         if data and data.id then
             filledCount = filledCount + 1
         end
     end
     
     local totalSlots = filledCount + 1
+    local slotsPerRow = ResourceTrackerAccountDB.slotsPerRow or 4
     
+    -- Hide extra slots if we have too many
+    for i = totalSlots + 1, #slots do
+        slots[i]:Hide()
+    end
+    
+    -- Position and show needed slots
     for i = 1, totalSlots do
         if not slots[i] then
             slots[i] = CreateSlot(mainFrame, i)
         end
-    end
-    
-    local slotsPerRow = ResourceTrackerAccountDB.slotsPerRow or 4
-    
-    for i = 1, totalSlots do
+        
         local slot = slots[i]
+        slot.slotIndex = i
+        
         local row = math.floor((i - 1) / slotsPerRow)
         local col = (i - 1) % slotsPerRow
         
@@ -559,36 +647,62 @@ RebuildSlots = function()
             -(TAB_HEIGHT + row * (SLOT_SIZE + SLOT_SPACING)))
         slot:SetParent(mainFrame)
         slot:Show()
-        
-        UpdateSlot(i)
     end
     
+    -- Position tab
     if mainFrame.tab and slots[1] then
         mainFrame.tab:ClearAllPoints()
         mainFrame.tab:SetPoint("BOTTOMLEFT", slots[1], "TOPLEFT", -1, 0)
     end
-    
-    for i = 1, totalSlots do
-        if slots[i]:IsShown() then
-            slots[i]:SetScript("OnEnter", function(self)
-                mainFrame.tab:Show()
-                local data = ResourceTrackerAccountDB.slots[i]
-                if data and data.id then
-                    GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-                    GameTooltip:SetHyperlink("item:" .. data.id)
-                    GameTooltip:Show()
-                end
-            end)
-            
-            slots[i]:SetScript("OnLeave", function(self)
-                GameTooltip:Hide()
-                mainFrame.tabHideTimer = 0.1
-            end)
-        end
-    end
 end
 
--- Save frame position to account-wide saved variables
+-- Rebuild all slots (full consolidation + count refresh)
+RebuildSlots = function()
+    if not mainFrame then return end
+    
+    -- Clean up stale data first
+    CleanupStaleData()
+    
+    -- Clear reusable tables
+    for k in pairs(consolidationTemp) do
+        consolidationTemp[k] = nil
+    end
+    for k in pairs(sortedIndicesTemp) do
+        sortedIndicesTemp[k] = nil
+    end
+    
+    -- Consolidate slots (remove gaps)
+    for i, data in pairs(ResourceTrackerAccountDB.slots) do
+        if data and data.id then
+            table.insert(sortedIndicesTemp, i)
+        end
+    end
+    table.sort(sortedIndicesTemp)
+    
+    for newIndex, oldIndex in ipairs(sortedIndicesTemp) do
+        consolidationTemp[newIndex] = ResourceTrackerAccountDB.slots[oldIndex]
+    end
+    
+    ResourceTrackerAccountDB.slots = consolidationTemp
+    -- Create new reference (old one is now saved)
+    consolidationTemp = {}
+    
+    -- Rebuild savedCounts to match current slots
+    savedCounts = {}
+    for _, data in pairs(ResourceTrackerAccountDB.slots) do
+        if data and data.id then
+            savedCounts[data.id] = GetTotalItemCount(data.id)
+        end
+    end
+    
+    -- Reposition slots
+    UpdateSlotPositions()
+    
+    -- Update all slot displays
+    UpdateAllSlots()
+end
+
+-- Save frame position
 local function SaveFramePosition()
     if not mainFrame then 
         return 
@@ -601,7 +715,7 @@ local function SaveFramePosition()
     end
 end
 
--- Load frame position from account-wide saved variables
+-- Load frame position
 local function LoadFramePosition()
     if not mainFrame then return end
     
@@ -611,10 +725,11 @@ local function LoadFramePosition()
     mainFrame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", x, y)
 end
 
--- Force save position after a delay
+-- Delayed position save frame (reused)
 local positionSaveFrame = CreateFrame("Frame")
 positionSaveFrame.delay = 0
 positionSaveFrame.func = nil
+positionSaveFrame:Hide()
 
 positionSaveFrame:SetScript("OnUpdate", function(self, elapsed)
     if self.delay > 0 then
@@ -629,7 +744,6 @@ positionSaveFrame:SetScript("OnUpdate", function(self, elapsed)
     end
 end)
 
--- Function to save position with a delay
 local function SavePositionDelayed(func, delay)
     positionSaveFrame.func = func
     positionSaveFrame.delay = delay or 0.1
@@ -685,23 +799,22 @@ local function CreateMainFrame()
     mainFrame.tab.text:SetTextColor(0.75, 0.61, 0.43)
     
     mainFrame.tab:EnableMouse(true)
-    mainFrame.tab:RegisterForDrag("LeftButton")
     mainFrame.isDragging = false
     
-    mainFrame.tab:SetScript("OnDragStart", function(self)
-        if not mainFrame.isLocked then
+    -- Make tab draggable by propagating to mainFrame
+    mainFrame.tab:SetScript("OnMouseDown", function(self, button)
+        if button == "LeftButton" and not mainFrame.isLocked then
             mainFrame.isDragging = true
             mainFrame:StartMoving()
         end
     end)
-    mainFrame.tab:SetScript("OnDragStop", function(self)
-        mainFrame.isDragging = false
-        mainFrame:StopMovingOrSizing()
-        SaveFramePosition()
-    end)
     
     mainFrame.tab:SetScript("OnMouseUp", function(self, button)
-        if button == "RightButton" then
+        if button == "LeftButton" and mainFrame.isDragging then
+            mainFrame.isDragging = false
+            mainFrame:StopMovingOrSizing()
+            SaveFramePosition()
+        elseif button == "RightButton" then
             if not dropdownMenu then
                 dropdownMenu = CreateFrame("Frame", "RTDropdownMenu", UIParent, "UIDropDownMenuTemplate")
             end
@@ -758,44 +871,83 @@ local function CreateMainFrame()
                 end
             end
         end
+        
+        -- Handle pending slots with timeout
+        if self.pendingSlots then
+            local currentTime = GetTime()
+            for slotIndex, startTime in pairs(self.pendingSlots) do
+                if currentTime - startTime > PENDING_TIMEOUT then
+                    -- Timeout reached, stop retrying
+                    self.pendingSlots[slotIndex] = nil
+                else
+                    -- Try to update again
+                    UpdateSlot(slotIndex)
+                end
+            end
+        end
     end)
     
     return mainFrame
 end
 
+-- Polling system for waiting on server updates
+pollingItems = {}
+local pollingFrame = CreateFrame("Frame")
+pollingFrame:Hide()
+pollingFrame:SetScript("OnUpdate", function(self, elapsed)
+    local currentTime = GetTime()
+    
+    for itemId, pollData in pairs(pollingItems) do
+        pollData.timer = pollData.timer + elapsed
+        pollData.totalTime = pollData.totalTime + elapsed
+        
+        -- Stop polling after timeout
+        if pollData.totalTime >= POLLING_TIMEOUT then
+            pollingItems[itemId] = nil
+        elseif pollData.timer >= POLLING_INTERVAL then
+            pollData.timer = 0
+            local currentCount = GetTotalItemCount(itemId)
+            
+            if currentCount ~= pollData.oldCount then
+                -- Value changed! Update only this item's slot and stop polling
+                savedCounts[itemId] = currentCount
+                
+                -- Find and update the slot for this item
+                for slotIndex, data in pairs(ResourceTrackerAccountDB.slots) do
+                    if data and data.id == itemId then
+                        UpdateSlot(slotIndex)
+                        break
+                    end
+                end
+                
+                pollingItems[itemId] = nil
+            end
+        end
+    end
+    
+    -- Hide frame if no more items to poll
+    local hasItems = false
+    for _ in pairs(pollingItems) do
+        hasItems = true
+        break
+    end
+    if not hasItems then
+        self:Hide()
+    end
+end)
+
 -- Event handler
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
-eventFrame:RegisterEvent("BAG_UPDATE")
-eventFrame:RegisterEvent("CURRENCY_DISPLAY_UPDATE")
+eventFrame:RegisterEvent("CHAT_MSG_LOOT")
 eventFrame:RegisterEvent("PLAYER_LOGOUT")
-
--- Separate update timer
-local updateTimer = 0
-local pendingRetryTimer = 0
-local updateFrame = CreateFrame("Frame")
-updateFrame:SetScript("OnUpdate", function(self, elapsed)
-    updateTimer = updateTimer + elapsed
-    if updateTimer >= 2 then
-        updateTimer = 0
-        UpdateAllSlots()
-    end
-    
-    -- Retry pending slots more frequently
-    pendingRetryTimer = pendingRetryTimer + elapsed
-    if pendingRetryTimer >= 0.5 then
-        pendingRetryTimer = 0
-        if mainFrame and mainFrame.pendingSlots then
-            for slotIndex, _ in pairs(mainFrame.pendingSlots) do
-                UpdateSlot(slotIndex)
-            end
-        end
-    end
-end)
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
+        -- Cache resource bank API availability (checked once)
+        hasResourceBankAPI = (GetCustomGameData ~= nil)
+        
         if not ResourceTrackerAccountDB.slotsPerRow then
             ResourceTrackerAccountDB.slotsPerRow = 4
         end
@@ -814,13 +966,59 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         SavePositionDelayed(function()
             LoadFramePosition()
         end, 0.5)
+        
     elseif event == "PLAYER_ENTERING_WORLD" then
-        RebuildSlots()
-        SavePositionDelayed(function()
-            LoadFramePosition()
-        end, 0.5)
-    elseif event == "BAG_UPDATE" or event == "CURRENCY_DISPLAY_UPDATE" then
-        UpdateAllSlots()
+        -- CRITICAL FIX: Only trigger on first login/reload, not zone changes
+        if not hasLoadedOnce then
+            hasLoadedOnce = true
+            
+            -- Condition #1: Player logging in - update all slots and save counts
+            -- Delay to let resource bank API become ready
+            SavePositionDelayed(function()
+                LoadFramePosition()
+                -- Update all tracked items and save their counts
+                UpdateAllSlots()
+            end, 1.0)
+        end
+        
+    elseif event == "CHAT_MSG_LOOT" then
+        -- Condition #3: Loot message - OPTIMIZED with item ID extraction
+        local lootText = arg1
+        
+        -- Extract item ID from loot link (faster and locale-safe)
+        local lootedItemId = tonumber(lootText:match("item:(%d+)"))
+        
+        if lootedItemId then
+            -- Check if this item is tracked
+            for slotIndex, data in pairs(ResourceTrackerAccountDB.slots) do
+                if data and data.id == lootedItemId then
+                    -- Found a match! Check if value updated yet
+                    local currentCount = GetTotalItemCount(lootedItemId)
+                    local oldCount = savedCounts[lootedItemId] or 0
+                    
+                    if currentCount ~= oldCount then
+                        -- Value already changed, update and save
+                        savedCounts[lootedItemId] = currentCount
+                        UpdateSlot(slotIndex)
+                    else
+                        -- Value hasn't changed yet, start polling
+                        if not pollingItems[lootedItemId] then
+                            pollingItems[lootedItemId] = {
+                                slotIndex = slotIndex,
+                                oldCount = oldCount,
+                                timer = 0,
+                                totalTime = 0
+                            }
+                            pollingFrame:Show()
+                        end
+                    end
+                    
+                    -- Only update the specific slot that was looted
+                    break
+                end
+            end
+        end
+        
     elseif event == "PLAYER_LOGOUT" then
         SaveFramePosition()
     end
