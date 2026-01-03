@@ -569,9 +569,16 @@ local function CreateSlot(parent, index)
                 
                 local menuList = {
                     {
-                        text = "Add Goal",
+                        text = data.goal and "Remove Goal" or "Add Goal",
                         func = function()
-                            ShowGoalDialog(index)
+                            if data.goal then
+                                -- Remove the goal
+                                ResourceTrackerAccountDB.slots[index].goal = nil
+                                UpdateSlot(index)
+                            else
+                                -- Show goal dialog
+                                ShowGoalDialog(index)
+                            end
                         end,
                         notCheckable = true
                     },
