@@ -701,11 +701,22 @@ CreateSlot = function(parent, index)
     slot.checkMark.shadow:SetSize(SLOT_SIZE * 0.95, SLOT_SIZE * 0.95)
     slot.checkMark.shadow:SetVertexColor(0, 0, 0, 0.5)
     slot:SetScript("OnClick", function(self, button)
-        if IsControlKeyDown() or IsAltKeyDown() or IsShiftKeyDown() then return end
+        local data = ResourceTrackerAccountDB.slots[index]
         if button == "LeftButton" then
-            ShowConfigDialog(index)
-        elseif button == "RightButton" then
-            local data = ResourceTrackerAccountDB.slots[index]
+            if IsShiftKeyDown() and data and data.id then
+                local itemLink = select(2, GetCachedItemInfo(data.id))
+                if itemLink and ChatEdit_GetActiveWindow() then
+                    ChatEdit_InsertLink(itemLink)
+                end
+            elseif IsAltKeyDown() and data and data.id then
+                local itemLink = select(2, GetCachedItemInfo(data.id))
+                if itemLink then
+                    SetItemRef(itemLink, itemLink, "LeftButton")
+                end
+            elseif not IsControlKeyDown() then
+                ShowConfigDialog(index)
+            end
+        elseif button == "RightButton" and not IsShiftKeyDown() and not IsAltKeyDown() and not IsControlKeyDown() then
             if data and data.id then
                 if not dropdownMenu then
                     dropdownMenu = CreateFrame("Frame", "RTDropdownMenu", UIParent, "UIDropDownMenuTemplate")
