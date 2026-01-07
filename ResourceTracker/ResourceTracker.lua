@@ -2,13 +2,21 @@ local addonName = "ResourceTracker"
 local RT = {}
 _G.ResourceTracker = RT
 
-ResourceTrackerAccountDB = ResourceTrackerAccountDB or {}
-ResourceTrackerAccountDB.anchorX = ResourceTrackerAccountDB.anchorX or 100
-ResourceTrackerAccountDB.anchorY = ResourceTrackerAccountDB.anchorY or -200
-ResourceTrackerAccountDB.slots = ResourceTrackerAccountDB.slots or {}
-ResourceTrackerAccountDB.isLocked = ResourceTrackerAccountDB.isLocked or false
-ResourceTrackerAccountDB.slotsPerRow = ResourceTrackerAccountDB.slotsPerRow or 4
-ResourceTrackerAccountDB.knownRecipes = ResourceTrackerAccountDB.knownRecipes or {}
+ResourceTrackerAccountDB = ResourceTrackerAccountDB or {
+    anchorX = 100,
+    anchorY = -200,
+    slots = {},
+    isLocked = false,
+    slotsPerRow = 4,
+    knownRecipes = {}
+}
+
+if not ResourceTrackerAccountDB.anchorX then ResourceTrackerAccountDB.anchorX = 100 end
+if not ResourceTrackerAccountDB.anchorY then ResourceTrackerAccountDB.anchorY = -200 end
+if not ResourceTrackerAccountDB.slots then ResourceTrackerAccountDB.slots = {} end
+if type(ResourceTrackerAccountDB.isLocked) ~= "boolean" then ResourceTrackerAccountDB.isLocked = false end
+if not ResourceTrackerAccountDB.slotsPerRow then ResourceTrackerAccountDB.slotsPerRow = 4 end
+if not ResourceTrackerAccountDB.knownRecipes then ResourceTrackerAccountDB.knownRecipes = {} end
 
 local mainFrame, dropdownMenu, configDialog, goalDialog, optionsDialog, reagentDialog, recipePromptDialog, clearAllDialog
 local slots = {}
@@ -998,6 +1006,13 @@ eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
         hasResourceBankAPI = (GetCustomGameData ~= nil)
+        if not ResourceTrackerAccountDB.slotsPerRow then ResourceTrackerAccountDB.slotsPerRow = 4 end
+        if not ResourceTrackerAccountDB.slots then ResourceTrackerAccountDB.slots = {} end
+        if not ResourceTrackerAccountDB.anchorX then
+            ResourceTrackerAccountDB.anchorX = 100
+            ResourceTrackerAccountDB.anchorY = -200
+        end
+        if not ResourceTrackerAccountDB.knownRecipes then ResourceTrackerAccountDB.knownRecipes = {} end
         CreateMainFrame()
         RebuildSlots()
     elseif event == "PLAYER_ENTERING_WORLD" then
