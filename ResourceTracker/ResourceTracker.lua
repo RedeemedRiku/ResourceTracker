@@ -1,25 +1,26 @@
--- ResourceTracker.lua
 local addonName = "ResourceTracker"
 local RT = {}
 _G.ResourceTracker = RT
 
--- Account-wide saved variables
 ResourceTrackerAccountDB = ResourceTrackerAccountDB or {}
 ResourceTrackerAccountDB.anchorX = ResourceTrackerAccountDB.anchorX or 100
 ResourceTrackerAccountDB.anchorY = ResourceTrackerAccountDB.anchorY or -200
 ResourceTrackerAccountDB.slots = ResourceTrackerAccountDB.slots or {}
 ResourceTrackerAccountDB.isLocked = ResourceTrackerAccountDB.isLocked or false
 ResourceTrackerAccountDB.slotsPerRow = ResourceTrackerAccountDB.slotsPerRow or 4
+ResourceTrackerAccountDB.knownRecipes = ResourceTrackerAccountDB.knownRecipes or {}
 
--- Frame references
-local mainFrame
+local mainFrame, dropdownMenu, configDialog, goalDialog, optionsDialog, reagentDialog, recipePromptDialog, clearAllDialog
 local slots = {}
-local dropdownMenu
-local configDialog
-local goalDialog
-local optionsDialog
+local savedCounts = {}
+local itemCache = {}
+local pollingItems = {}
+local addQueue = {}
+local isProcessingQueue = false
+local currentQueueItem = nil
+local hasLoadedOnce = false
+local hasResourceBankAPI = false
 
--- Constants
 local SLOT_SIZE = 37
 local SLOT_SPACING = 4
 local TAB_HEIGHT = 24
@@ -27,28 +28,40 @@ local PENDING_TIMEOUT = 10
 local POLLING_TIMEOUT = 10
 local POLLING_INTERVAL = 1.0
 
--- Saved item counts (to detect changes)
-local savedCounts = {}
+local PROFESSIONS = {
+    "Alchemy", "Blacksmithing", "Enchanting", "Engineering",
+    "Inscription", "Jewelcrafting", "Leatherworking", "Mining",
+    "Tailoring", "Cooking", "First Aid"
+}
 
--- Item info cache
-local itemCache = {}
+local RECIPE_BLACKLIST = {
+    [35622] = true, [35623] = true, [35624] = true, [35625] = true,
+    [35627] = true, [36860] = true, [21884] = true, [21885] = true,
+    [21886] = true, [22451] = true, [22452] = true, [22456] = true,
+    [22457] = true, [22573] = true, [22574] = true, [7076] = true,
+    [7078] = true, [7080] = true, [7082] = true, [12803] = true,
+    [12808] = true
+}
 
--- Session tracking
-local hasLoadedOnce = false
+local ELEMENTAL_CONVERSIONS = {
+    [35622] = {component = 37705, count = 10},
+    [35623] = {component = 37700, count = 10},
+    [35624] = {component = 37701, count = 10},
+    [35625] = {component = 37704, count = 10},
+    [35627] = {component = 37703, count = 10},
+    [36860] = {component = 37702, count = 10},
+    [21884] = {component = 22574, count = 10},
+    [21885] = {component = 22578, count = 10},
+    [21886] = {component = 22575, count = 10},
+    [22451] = {component = 22572, count = 10},
+    [22452] = {component = 22573, count = 10},
+    [22456] = {component = 22577, count = 10},
+    [22457] = {component = 22576, count = 10}
+}
 
--- Cache API availability (checked once at load)
-local hasResourceBankAPI = false
-
--- Reusable tables for consolidation (avoid GC pressure)
-local consolidationTemp = {}
-local sortedIndicesTemp = {}
-
--- Helper function to format numbers
 local function FormatCount(count)
     if count >= 1000000 then
         return string.format("%.1fm", count / 1000000)
-    elseif count >= 100000 then
-        return string.format("%dk", math.floor(count / 1000))
     elseif count >= 10000 then
         return string.format("%.1fk", count / 1000)
     elseif count >= 1000 then
@@ -58,121 +71,136 @@ local function FormatCount(count)
     end
 end
 
--- Cached GetItemInfo
 local function GetCachedItemInfo(id)
     if not itemCache[id] then
         local name, link, quality, iLevel, reqLevel, class, subclass, maxStack, equipSlot, texture = GetItemInfo(id)
-        if texture then  -- Only cache if successfully retrieved
+        if texture then
             itemCache[id] = {name, link, quality, iLevel, reqLevel, class, subclass, maxStack, equipSlot, texture}
         else
-            return nil  -- Not cached yet
+            return nil
         end
     end
     return unpack(itemCache[id])
 end
 
--- Get total count of an item across all sources (optimized)
 local function GetTotalItemCount(itemId)
     local total = GetItemCount(itemId, true)
-    
     if hasResourceBankAPI then
         local resourceBankCount = GetCustomGameData(13, itemId)
         if resourceBankCount and type(resourceBankCount) == "number" then
             total = total + resourceBankCount
         end
     end
-    
     return total
 end
 
--- Forward declarations
-local UpdateSlot
-local UpdateAllSlots
-local RebuildSlots
-local UpdateSlotPositions
-local ShowGoalDialog
-local CleanupStaleData
+local function GetItemIdFromLink(link)
+    if not link then return nil end
+    local itemId = link:match("item:(%d+)")
+    return tonumber(itemId)
+end
 
--- Update a single slot's display
-UpdateSlot = function(slotIndex)
-    local slot = slots[slotIndex]
-    if not slot then return end
-    
-    local data = ResourceTrackerAccountDB.slots[slotIndex]
-    
-    if not data or not data.id then
-        -- Empty slot with green +
-        slot.icon:SetTexture("Interface\\PaperDoll\\UI-Backpack-EmptySlot")
-        slot.icon:SetDesaturated(true)
-        slot.count:SetText("")
-        slot.goalText:Hide()
-        slot.checkMark:Hide()
-        slot.plusSign:Show()
-        return
-    end
-    
-    slot.plusSign:Hide()
-    
-    -- Request item info using cached version
-    local itemName, _, _, _, _, _, _, _, _, texture = GetCachedItemInfo(data.id)
-    
-    if not texture then
-        -- Item not in cache yet, request it and show loading state
-        slot.icon:SetTexture("Interface\\PaperDoll\\UI-Backpack-EmptySlot")
-        slot.icon:SetDesaturated(false)
-        slot.count:SetText("...")
-        slot.goalText:Hide()
-        slot.checkMark:Hide()
-        -- Queue this slot for retry with timestamp
-        if not mainFrame.pendingSlots then
-            mainFrame.pendingSlots = {}
+local function ScanTradeSkillRecipes(professionName)
+    if not professionName then return end
+    local recipesData = {}
+    local numSkills = GetNumTradeSkills()
+    for i = 1, numSkills do
+        local skillName, skillType = GetTradeSkillInfo(i)
+        if skillType ~= "header" then
+            local link = GetTradeSkillItemLink(i)
+            if link then
+                local recipeItemId = GetItemIdFromLink(link)
+                if recipeItemId then
+                    local reagents = {}
+                    local numReagents = GetTradeSkillNumReagents(i)
+                    for r = 1, numReagents do
+                        local reagentLink = GetTradeSkillReagentItemLink(i, r)
+                        local _, _, reagentCount = GetTradeSkillReagentInfo(i, r)
+                        local reagentId = GetItemIdFromLink(reagentLink)
+                        if reagentId and reagentCount then
+                            table.insert(reagents, {id = reagentId, count = reagentCount})
+                        end
+                    end
+                    recipesData[recipeItemId] = {name = skillName, reagents = reagents}
+                end
+            end
         end
-        mainFrame.pendingSlots[slotIndex] = GetTime()
-        return
     end
-    
-    -- Item is cached, display it normally
-    local count = GetTotalItemCount(data.id)
-    
-    -- Save the count
-    savedCounts[data.id] = count
-    
-    slot.icon:SetTexture(texture)
-    slot.icon:SetDesaturated(false)
-    slot.count:SetText(FormatCount(count))
-    
-    if data.goal then
-        slot.goalText:SetText(FormatCount(data.goal))
-        slot.goalText:Show()
-        
-        if count >= data.goal then
-            slot.checkMark:Show()
-        else
-            slot.checkMark:Hide()
+    ResourceTrackerAccountDB.knownRecipes[professionName] = recipesData
+end
+
+local function GetMissingProfessions()
+    local missing = {}
+    for _, prof in ipairs(PROFESSIONS) do
+        if not ResourceTrackerAccountDB.knownRecipes[prof] or not next(ResourceTrackerAccountDB.knownRecipes[prof]) then
+            table.insert(missing, prof)
         end
-    else
-        slot.goalText:Hide()
-        slot.checkMark:Hide()
     end
-    
-    -- Remove from pending list if it was there
-    if mainFrame.pendingSlots then
-        mainFrame.pendingSlots[slotIndex] = nil
+    return missing
+end
+
+local function ShowRecipePrompt(missingProfessions)
+    if not recipePromptDialog then
+        recipePromptDialog = CreateFrame("Frame", "RTRecipePromptDialog", UIParent)
+        recipePromptDialog:SetSize(360, 280)
+        recipePromptDialog:SetPoint("CENTER")
+        recipePromptDialog:SetFrameStrata("DIALOG")
+        recipePromptDialog:EnableMouse(true)
+        recipePromptDialog:SetMovable(true)
+        recipePromptDialog:RegisterForDrag("LeftButton")
+        recipePromptDialog:SetClampedToScreen(true)
+        recipePromptDialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
+        })
+        recipePromptDialog:SetBackdropColor(0, 0, 0, 0.9)
+        recipePromptDialog.title = recipePromptDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        recipePromptDialog.title:SetPoint("TOP", 0, -15)
+        recipePromptDialog.title:SetText("Recipe Data Needed")
+        recipePromptDialog.text = recipePromptDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        recipePromptDialog.text:SetPoint("TOP", recipePromptDialog.title, "BOTTOM", 0, -15)
+        recipePromptDialog.text:SetWidth(320)
+        recipePromptDialog.text:SetJustifyH("LEFT")
+        recipePromptDialog.okButton = CreateFrame("Button", nil, recipePromptDialog, "UIPanelButtonTemplate")
+        recipePromptDialog.okButton:SetSize(80, 22)
+        recipePromptDialog.okButton:SetPoint("BOTTOM", 0, 15)
+        recipePromptDialog.okButton:SetText("OK")
+        recipePromptDialog.okButton:SetScript("OnClick", function() recipePromptDialog:Hide() end)
+        recipePromptDialog:SetScript("OnDragStart", recipePromptDialog.StartMoving)
+        recipePromptDialog:SetScript("OnDragStop", recipePromptDialog.StopMovingOrSizing)
+        recipePromptDialog:Hide()
+    end
+    local promptText = "Please open the following profession windows to cache recipe data:\n\n"
+    for i, prof in ipairs(missingProfessions) do
+        promptText = promptText .. "  " .. prof .. "\n"
+    end
+    recipePromptDialog.text:SetText(promptText)
+    recipePromptDialog:Show()
+end
+
+local function CheckRecipeDataAndPrompt()
+    local missing = GetMissingProfessions()
+    if #missing > 0 then
+        ShowRecipePrompt(missing)
     end
 end
 
--- Update all slots
-UpdateAllSlots = function()
-    if not mainFrame then return end
-    
-    for i = 1, #slots do
-        UpdateSlot(i)
+local function FindRecipeForItem(itemId)
+    if not itemId or RECIPE_BLACKLIST[itemId] then return nil end
+    for profName, recipes in pairs(ResourceTrackerAccountDB.knownRecipes) do
+        if recipes[itemId] then
+            return recipes[itemId].reagents
+        end
     end
+    return nil
 end
 
--- Clean up stale data from memory (optimized single-pass)
-CleanupStaleData = function()
-    -- Single pass: check each saved/polled item against current slots
+local UpdateSlot, UpdateAllSlots, RebuildSlots, UpdateSlotPositions, ShowGoalDialog
+local AddItemToSlot, QueueItemAdd, ProcessNextQueueItem, CreateSlot, ShowReagentDialog, ShowElementalDialog, ShowClearAllDialog
+
+local function CleanupStaleData()
     for itemId in pairs(savedCounts) do
         local isTracked = false
         for _, data in pairs(ResourceTrackerAccountDB.slots) do
@@ -186,70 +214,216 @@ CleanupStaleData = function()
             pollingItems[itemId] = nil
         end
     end
-    
-    -- Check pollingItems for any that aren't in savedCounts
-    for itemId in pairs(pollingItems) do
-        if not savedCounts[itemId] then
-            pollingItems[itemId] = nil
-        end
-    end
 end
 
--- Common validation function for item IDs
-local function ValidateItemId(id)
-    if not id or id <= 0 then
-        return false, "|cffff0000Please enter a valid Item ID|r"
-    end
-    
-    local itemName = GetCachedItemInfo(id)
-    if not itemName then
-        return false, "|cffff0000Invalid Item ID: " .. id .. "|r"
-    end
-    
-    for i, data in pairs(ResourceTrackerAccountDB.slots) do
-        if data and data.id == id then
-            return false, "|cffff0000Item already tracked in another slot!|r"
+AddItemToSlot = function(itemId, slotIndex, goalAmount)
+    for existingSlot, data in pairs(ResourceTrackerAccountDB.slots) do
+        if data and data.id == itemId then
+            if goalAmount and goalAmount > 0 then
+                ResourceTrackerAccountDB.slots[existingSlot].goal = (data.goal or 0) + goalAmount
+                UpdateSlot(existingSlot)
+            end
+            return
         end
     end
-    
-    return true
-end
-
--- Common function to update dialog after validation (optimized - no rebuild)
-local function UpdateDialogAfterValidation(dialog, slotIndex)
-    local itemId = dialog.editBox:GetNumber()
-    ResourceTrackerAccountDB.slots[slotIndex] = {
-        type = "item",
-        id = itemId
-    }
-    
-    -- Only update this specific slot and save its count (no full rebuild)
+    if not slotIndex then
+        slotIndex = 1
+        for i, data in pairs(ResourceTrackerAccountDB.slots) do
+            if data and data.id then
+                slotIndex = math.max(slotIndex, i + 1)
+            end
+        end
+    end
+    ResourceTrackerAccountDB.slots[slotIndex] = {type = "item", id = itemId, goal = goalAmount}
     savedCounts[itemId] = GetTotalItemCount(itemId)
-    
-    -- If adding to a new slot position, we may need to add the empty slot after it
     local filledCount = 0
     for _, data in pairs(ResourceTrackerAccountDB.slots) do
         if data and data.id then
             filledCount = filledCount + 1
         end
     end
-    
     local totalSlots = filledCount + 1
     if totalSlots > #slots then
-        -- Need to create a new slot
         slots[totalSlots] = CreateSlot(mainFrame, totalSlots)
     end
-    
-    -- Reposition slots (lightweight - no count queries)
     UpdateSlotPositions()
-    
-    -- Update only the new slot
     UpdateSlot(slotIndex)
-    
-    dialog:Hide()
 end
 
--- Show config dialog for a slot
+QueueItemAdd = function(itemId, slotIndex, goalAmount)
+    table.insert(addQueue, {itemId = itemId, slotIndex = slotIndex, goalAmount = goalAmount})
+    if not isProcessingQueue then
+        ProcessNextQueueItem()
+    end
+end
+
+ProcessNextQueueItem = function()
+    if #addQueue == 0 then
+        isProcessingQueue = false
+        currentQueueItem = nil
+        return
+    end
+    isProcessingQueue = true
+    currentQueueItem = table.remove(addQueue, 1)
+    local elementalConversion = ELEMENTAL_CONVERSIONS[currentQueueItem.itemId]
+    if elementalConversion then
+        ShowElementalDialog(currentQueueItem.itemId, elementalConversion)
+        return
+    end
+    local reagents = FindRecipeForItem(currentQueueItem.itemId)
+    if reagents and #reagents > 0 then
+        ShowReagentDialog(currentQueueItem.itemId, reagents)
+    else
+        AddItemToSlot(currentQueueItem.itemId, currentQueueItem.slotIndex, currentQueueItem.goalAmount)
+        ProcessNextQueueItem()
+    end
+end
+ShowReagentDialog = function(craftedItemId, reagents)
+    if not reagentDialog then
+        reagentDialog = CreateFrame("Frame", "RTReagentDialog", UIParent)
+        reagentDialog:SetSize(340, 280)
+        reagentDialog:SetPoint("CENTER")
+        reagentDialog:SetFrameStrata("DIALOG")
+        reagentDialog:EnableMouse(true)
+        reagentDialog:SetMovable(true)
+        reagentDialog:RegisterForDrag("LeftButton")
+        reagentDialog:SetClampedToScreen(true)
+        reagentDialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
+        })
+        reagentDialog:SetBackdropColor(0, 0, 0, 0.9)
+        reagentDialog.title = reagentDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        reagentDialog.title:SetPoint("TOP", 0, -15)
+        reagentDialog.text = reagentDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        reagentDialog.text:SetPoint("TOP", reagentDialog.title, "BOTTOM", 0, -15)
+        reagentDialog.text:SetWidth(300)
+        reagentDialog.text:SetJustifyH("LEFT")
+        reagentDialog.scrollFrame = CreateFrame("ScrollFrame", nil, reagentDialog)
+        reagentDialog.scrollFrame:SetSize(300, 150)
+        reagentDialog.scrollFrame:SetPoint("TOP", reagentDialog.text, "BOTTOM", 0, -10)
+        reagentDialog.scrollChild = CreateFrame("Frame", nil, reagentDialog.scrollFrame)
+        reagentDialog.scrollChild:SetSize(280, 1)
+        reagentDialog.scrollFrame:SetScrollChild(reagentDialog.scrollChild)
+        reagentDialog.checkboxes = {}
+        reagentDialog.yesButton = CreateFrame("Button", nil, reagentDialog, "UIPanelButtonTemplate")
+        reagentDialog.yesButton:SetSize(80, 22)
+        reagentDialog.yesButton:SetPoint("BOTTOM", -45, 15)
+        reagentDialog.yesButton:SetText("Yes")
+        reagentDialog.noButton = CreateFrame("Button", nil, reagentDialog, "UIPanelButtonTemplate")
+        reagentDialog.noButton:SetSize(80, 22)
+        reagentDialog.noButton:SetPoint("BOTTOM", 45, 15)
+        reagentDialog.noButton:SetText("No")
+        reagentDialog:SetScript("OnDragStart", reagentDialog.StartMoving)
+        reagentDialog:SetScript("OnDragStop", reagentDialog.StopMovingOrSizing)
+        reagentDialog:Hide()
+    end
+    reagentDialog:SetSize(340, 280)
+    reagentDialog.title:SetText("Add Reagents?")
+    if reagentDialog.scrollFrame then reagentDialog.scrollFrame:Show() end
+    for _, cb in ipairs(reagentDialog.checkboxes) do cb:Hide() end
+    local itemName = GetCachedItemInfo(craftedItemId) or ("Item " .. craftedItemId)
+    reagentDialog.text:SetText(itemName .. " requires:")
+    for i, reagent in ipairs(reagents) do
+        if not reagentDialog.checkboxes[i] then
+            local cb = CreateFrame("CheckButton", nil, reagentDialog.scrollChild, "UICheckButtonTemplate")
+            cb:SetSize(24, 24)
+            cb.text = cb:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+            cb.text:SetPoint("LEFT", cb, "RIGHT", 5, 0)
+            reagentDialog.checkboxes[i] = cb
+        end
+        local cb = reagentDialog.checkboxes[i]
+        cb:SetPoint("TOPLEFT", 10, -(i - 1) * 30)
+        local reagentName = GetCachedItemInfo(reagent.id) or ("Item " .. reagent.id)
+        cb.text:SetText(reagentName .. " x" .. reagent.count)
+        cb:SetChecked(true)
+        cb.reagentData = reagent
+        cb:Show()
+    end
+    reagentDialog.scrollChild:SetHeight(math.max(#reagents * 30, 1))
+    reagentDialog.currentReagents = reagents
+    reagentDialog.yesButton:SetScript("OnClick", function()
+        reagentDialog:Hide()
+        AddItemToSlot(currentQueueItem.itemId, currentQueueItem.slotIndex, currentQueueItem.goalAmount)
+        for i, reagent in ipairs(reagentDialog.currentReagents) do
+            local cb = reagentDialog.checkboxes[i]
+            if cb and cb:GetChecked() then
+                local multipliedCount = reagent.count
+                if currentQueueItem.goalAmount then
+                    multipliedCount = reagent.count * currentQueueItem.goalAmount
+                end
+                QueueItemAdd(reagent.id, nil, multipliedCount)
+            end
+        end
+        ProcessNextQueueItem()
+    end)
+    reagentDialog.noButton:SetScript("OnClick", function()
+        reagentDialog:Hide()
+        AddItemToSlot(currentQueueItem.itemId, currentQueueItem.slotIndex, currentQueueItem.goalAmount)
+        ProcessNextQueueItem()
+    end)
+    reagentDialog:Show()
+end
+
+ShowElementalDialog = function(parentItemId, conversion)
+    if not reagentDialog then
+        reagentDialog = CreateFrame("Frame", "RTReagentDialog", UIParent)
+        reagentDialog:SetSize(340, 180)
+        reagentDialog:SetPoint("CENTER")
+        reagentDialog:SetFrameStrata("DIALOG")
+        reagentDialog:EnableMouse(true)
+        reagentDialog:SetMovable(true)
+        reagentDialog:RegisterForDrag("LeftButton")
+        reagentDialog:SetClampedToScreen(true)
+        reagentDialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
+        })
+        reagentDialog:SetBackdropColor(0, 0, 0, 0.9)
+        reagentDialog.title = reagentDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        reagentDialog.title:SetPoint("TOP", 0, -15)
+        reagentDialog.text = reagentDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        reagentDialog.text:SetPoint("TOP", reagentDialog.title, "BOTTOM", 0, -15)
+        reagentDialog.text:SetWidth(300)
+        reagentDialog.text:SetJustifyH("LEFT")
+        reagentDialog.yesButton = CreateFrame("Button", nil, reagentDialog, "UIPanelButtonTemplate")
+        reagentDialog.yesButton:SetSize(80, 22)
+        reagentDialog.yesButton:SetPoint("BOTTOM", -45, 15)
+        reagentDialog.yesButton:SetText("Yes")
+        reagentDialog.noButton = CreateFrame("Button", nil, reagentDialog, "UIPanelButtonTemplate")
+        reagentDialog.noButton:SetSize(80, 22)
+        reagentDialog.noButton:SetPoint("BOTTOM", 45, 15)
+        reagentDialog.noButton:SetText("No")
+        reagentDialog:SetScript("OnDragStart", reagentDialog.StartMoving)
+        reagentDialog:SetScript("OnDragStop", reagentDialog.StopMovingOrSizing)
+        reagentDialog:Hide()
+    end
+    for _, cb in ipairs(reagentDialog.checkboxes or {}) do cb:Hide() end
+    if reagentDialog.scrollFrame then reagentDialog.scrollFrame:Hide() end
+    reagentDialog:SetSize(340, 180)
+    reagentDialog.title:SetText("Add Component?")
+    local parentName = GetCachedItemInfo(parentItemId) or ("Item " .. parentItemId)
+    local componentName = GetCachedItemInfo(conversion.component) or ("Item " .. conversion.component)
+    reagentDialog.text:SetText(parentName .. " can be created from:\n\n  " .. componentName .. " x" .. conversion.count .. "\n\nAdd this component to the tracker?")
+    reagentDialog.yesButton:SetScript("OnClick", function()
+        reagentDialog:Hide()
+        AddItemToSlot(currentQueueItem.itemId, currentQueueItem.slotIndex, currentQueueItem.goalAmount)
+        local componentGoal = currentQueueItem.goalAmount and (currentQueueItem.goalAmount * conversion.count) or nil
+        QueueItemAdd(conversion.component, nil, componentGoal)
+        ProcessNextQueueItem()
+    end)
+    reagentDialog.noButton:SetScript("OnClick", function()
+        reagentDialog:Hide()
+        AddItemToSlot(currentQueueItem.itemId, currentQueueItem.slotIndex, currentQueueItem.goalAmount)
+        ProcessNextQueueItem()
+    end)
+    reagentDialog:Show()
+end
+
 local function ShowConfigDialog(slotIndex)
     if not configDialog then
         configDialog = CreateFrame("Frame", "RTConfigDialog", UIParent)
@@ -260,77 +434,62 @@ local function ShowConfigDialog(slotIndex)
         configDialog:SetMovable(true)
         configDialog:RegisterForDrag("LeftButton")
         configDialog:SetClampedToScreen(true)
-        
         configDialog:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
             edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true,
-            tileSize = 32,
-            edgeSize = 32,
-            insets = { left = 11, right = 12, top = 12, bottom = 11 }
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
         })
         configDialog:SetBackdropColor(0, 0, 0, 0.9)
-        
         configDialog.title = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
         configDialog.title:SetPoint("TOP", 0, -15)
         configDialog.title:SetText("Enter Item ID")
-        
-        configDialog.editBox = CreateFrame("EditBox", "RTEditBox", configDialog, "InputBoxTemplate")
+        configDialog.editBox = CreateFrame("EditBox", nil, configDialog, "InputBoxTemplate")
         configDialog.editBox:SetSize(200, 20)
         configDialog.editBox:SetPoint("TOP", configDialog.title, "BOTTOM", 0, -20)
         configDialog.editBox:SetAutoFocus(false)
         configDialog.editBox:SetMaxLetters(10)
         configDialog.editBox:SetNumeric(true)
-        
-        configDialog.editBox:SetScript("OnEscapePressed", function(self)
-            self:ClearFocus()
-        end)
-        
+        configDialog.editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
         configDialog.editBox:SetScript("OnEnterPressed", function(self)
             local id = tonumber(self:GetText())
-            local isValid, errorMsg = ValidateItemId(id)
-            if isValid then
-                UpdateDialogAfterValidation(configDialog, configDialog.currentSlot)
+            if id and id > 0 and GetCachedItemInfo(id) then
+                configDialog:Hide()
+                addQueue = {}
+                QueueItemAdd(id, configDialog.currentSlot, nil)
             else
-                print(errorMsg)
+                print("|cffff0000Invalid Item ID|r")
             end
         end)
-        
-        configDialog.okButton = CreateFrame("Button", "RTOkButton", configDialog, "UIPanelButtonTemplate")
+        configDialog.okButton = CreateFrame("Button", nil, configDialog, "UIPanelButtonTemplate")
         configDialog.okButton:SetSize(80, 22)
         configDialog.okButton:SetPoint("BOTTOM", -45, 15)
         configDialog.okButton:SetText("OK")
         configDialog.okButton:SetScript("OnClick", function()
             local id = tonumber(configDialog.editBox:GetText())
-            local isValid, errorMsg = ValidateItemId(id)
-            if isValid then
-                UpdateDialogAfterValidation(configDialog, configDialog.currentSlot)
+            if id and id > 0 and GetCachedItemInfo(id) then
+                configDialog:Hide()
+                addQueue = {}
+                QueueItemAdd(id, configDialog.currentSlot, nil)
             else
-                print(errorMsg)
+                print("|cffff0000Invalid Item ID|r")
             end
         end)
-        
-        configDialog.cancelButton = CreateFrame("Button", "RTCancelButton", configDialog, "UIPanelButtonTemplate")
+        configDialog.cancelButton = CreateFrame("Button", nil, configDialog, "UIPanelButtonTemplate")
         configDialog.cancelButton:SetSize(80, 22)
         configDialog.cancelButton:SetPoint("BOTTOM", 45, 15)
         configDialog.cancelButton:SetText("Cancel")
-        configDialog.cancelButton:SetScript("OnClick", function()
-            configDialog:Hide()
-        end)
-        
+        configDialog.cancelButton:SetScript("OnClick", function() configDialog:Hide() end)
         configDialog:SetScript("OnDragStart", configDialog.StartMoving)
         configDialog:SetScript("OnDragStop", configDialog.StopMovingOrSizing)
-        
         configDialog:Hide()
     end
-    
     configDialog.currentSlot = slotIndex
     configDialog.editBox:SetText("")
     configDialog:Show()
     configDialog.editBox:SetFocus()
 end
 
--- Show goal dialog for a slot
 ShowGoalDialog = function(slotIndex)
     if not goalDialog then
         goalDialog = CreateFrame("Frame", "RTGoalDialog", UIParent)
@@ -341,76 +500,56 @@ ShowGoalDialog = function(slotIndex)
         goalDialog:SetMovable(true)
         goalDialog:RegisterForDrag("LeftButton")
         goalDialog:SetClampedToScreen(true)
-        
         goalDialog:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
             edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true,
-            tileSize = 32,
-            edgeSize = 32,
-            insets = { left = 11, right = 12, top = 12, bottom = 11 }
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
         })
         goalDialog:SetBackdropColor(0, 0, 0, 0.9)
-        
         goalDialog.title = goalDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
         goalDialog.title:SetPoint("TOP", 0, -15)
         goalDialog.title:SetText("Set Goal Amount")
-        
-        goalDialog.editBox = CreateFrame("EditBox", "RTGoalEditBox", goalDialog, "InputBoxTemplate")
+        goalDialog.editBox = CreateFrame("EditBox", nil, goalDialog, "InputBoxTemplate")
         goalDialog.editBox:SetSize(200, 20)
         goalDialog.editBox:SetPoint("TOP", goalDialog.title, "BOTTOM", 0, -20)
         goalDialog.editBox:SetAutoFocus(false)
         goalDialog.editBox:SetMaxLetters(10)
         goalDialog.editBox:SetNumeric(true)
-        
-        goalDialog.editBox:SetScript("OnEscapePressed", function(self)
-            self:ClearFocus()
-        end)
-        
+        goalDialog.editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
         goalDialog.editBox:SetScript("OnEnterPressed", function(self)
             local goal = tonumber(self:GetText())
-            if goal and goal > 0 then
-                if ResourceTrackerAccountDB.slots[goalDialog.currentSlot] then
-                    ResourceTrackerAccountDB.slots[goalDialog.currentSlot].goal = goal
-                    UpdateSlot(goalDialog.currentSlot)
-                end
+            if goal and goal > 0 and ResourceTrackerAccountDB.slots[goalDialog.currentSlot] then
+                ResourceTrackerAccountDB.slots[goalDialog.currentSlot].goal = goal
+                UpdateSlot(goalDialog.currentSlot)
                 goalDialog:Hide()
             else
-                print("|cffff0000Please enter a valid goal amount|r")
+                print("|cffff0000Invalid goal amount|r")
             end
         end)
-        
-        goalDialog.okButton = CreateFrame("Button", "RTGoalOkButton", goalDialog, "UIPanelButtonTemplate")
+        goalDialog.okButton = CreateFrame("Button", nil, goalDialog, "UIPanelButtonTemplate")
         goalDialog.okButton:SetSize(80, 22)
         goalDialog.okButton:SetPoint("BOTTOM", -45, 15)
         goalDialog.okButton:SetText("OK")
         goalDialog.okButton:SetScript("OnClick", function()
             local goal = tonumber(goalDialog.editBox:GetText())
-            if goal and goal > 0 then
-                if ResourceTrackerAccountDB.slots[goalDialog.currentSlot] then
-                    ResourceTrackerAccountDB.slots[goalDialog.currentSlot].goal = goal
-                    UpdateSlot(goalDialog.currentSlot)
-                end
+            if goal and goal > 0 and ResourceTrackerAccountDB.slots[goalDialog.currentSlot] then
+                ResourceTrackerAccountDB.slots[goalDialog.currentSlot].goal = goal
+                UpdateSlot(goalDialog.currentSlot)
                 goalDialog:Hide()
             else
-                print("|cffff0000Please enter a valid goal amount|r")
+                print("|cffff0000Invalid goal amount|r")
             end
         end)
-        
-        goalDialog.cancelButton = CreateFrame("Button", "RTGoalCancelButton", goalDialog, "UIPanelButtonTemplate")
+        goalDialog.cancelButton = CreateFrame("Button", nil, goalDialog, "UIPanelButtonTemplate")
         goalDialog.cancelButton:SetSize(80, 22)
         goalDialog.cancelButton:SetPoint("BOTTOM", 45, 15)
         goalDialog.cancelButton:SetText("Cancel")
-        goalDialog.cancelButton:SetScript("OnClick", function()
-            goalDialog:Hide()
-        end)
-        
+        goalDialog.cancelButton:SetScript("OnClick", function() goalDialog:Hide() end)
         goalDialog:SetScript("OnDragStart", goalDialog.StartMoving)
         goalDialog:SetScript("OnDragStop", goalDialog.StopMovingOrSizing)
-        
         goalDialog:Hide()
     end
-    
     goalDialog.currentSlot = slotIndex
     local data = ResourceTrackerAccountDB.slots[slotIndex]
     goalDialog.editBox:SetText(data and data.goal and tostring(data.goal) or "")
@@ -418,7 +557,6 @@ ShowGoalDialog = function(slotIndex)
     goalDialog.editBox:SetFocus()
 end
 
--- Show options dialog
 local function ShowOptionsDialog()
     if not optionsDialog then
         optionsDialog = CreateFrame("Frame", "RTOptionsDialog", UIParent)
@@ -429,37 +567,27 @@ local function ShowOptionsDialog()
         optionsDialog:SetMovable(true)
         optionsDialog:RegisterForDrag("LeftButton")
         optionsDialog:SetClampedToScreen(true)
-        
         optionsDialog:SetBackdrop({
             bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
             edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-            tile = true,
-            tileSize = 32,
-            edgeSize = 32,
-            insets = { left = 11, right = 12, top = 12, bottom = 11 }
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
         })
         optionsDialog:SetBackdropColor(0, 0, 0, 0.9)
-        
         optionsDialog.title = optionsDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
         optionsDialog.title:SetPoint("TOP", 0, -15)
         optionsDialog.title:SetText("Options")
-        
         optionsDialog.label = optionsDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         optionsDialog.label:SetPoint("TOP", optionsDialog.title, "BOTTOM", 0, -20)
         optionsDialog.label:SetText("Slots per row:")
-        
-        optionsDialog.editBox = CreateFrame("EditBox", "RTOptionsEditBox", optionsDialog, "InputBoxTemplate")
+        optionsDialog.editBox = CreateFrame("EditBox", nil, optionsDialog, "InputBoxTemplate")
         optionsDialog.editBox:SetSize(60, 20)
         optionsDialog.editBox:SetPoint("TOP", optionsDialog.label, "BOTTOM", 0, -10)
         optionsDialog.editBox:SetAutoFocus(false)
         optionsDialog.editBox:SetMaxLetters(2)
         optionsDialog.editBox:SetNumeric(true)
-        
-        optionsDialog.editBox:SetScript("OnEscapePressed", function(self)
-            self:ClearFocus()
-        end)
-        
-        optionsDialog.okButton = CreateFrame("Button", "RTOptionsOkButton", optionsDialog, "UIPanelButtonTemplate")
+        optionsDialog.editBox:SetScript("OnEscapePressed", function(self) self:ClearFocus() end)
+        optionsDialog.okButton = CreateFrame("Button", nil, optionsDialog, "UIPanelButtonTemplate")
         optionsDialog.okButton:SetSize(80, 22)
         optionsDialog.okButton:SetPoint("BOTTOM", -45, 15)
         optionsDialog.okButton:SetText("OK")
@@ -467,97 +595,113 @@ local function ShowOptionsDialog()
             local value = tonumber(optionsDialog.editBox:GetText())
             if value and value > 0 and value <= 20 then
                 ResourceTrackerAccountDB.slotsPerRow = value
-                -- Just reposition, no need to rebuild counts
                 UpdateSlotPositions()
             else
-                print("|cffff0000ResourceTracker: Please enter a number between 1 and 20|r")
+                print("|cffff0000Enter 1-20|r")
             end
             optionsDialog:Hide()
         end)
-        
-        optionsDialog.cancelButton = CreateFrame("Button", "RTOptionsCancelButton", optionsDialog, "UIPanelButtonTemplate")
+        optionsDialog.cancelButton = CreateFrame("Button", nil, optionsDialog, "UIPanelButtonTemplate")
         optionsDialog.cancelButton:SetSize(80, 22)
         optionsDialog.cancelButton:SetPoint("BOTTOM", 45, 15)
         optionsDialog.cancelButton:SetText("Cancel")
-        optionsDialog.cancelButton:SetScript("OnClick", function()
-            optionsDialog:Hide()
-        end)
-        
+        optionsDialog.cancelButton:SetScript("OnClick", function() optionsDialog:Hide() end)
         optionsDialog:SetScript("OnDragStart", optionsDialog.StartMoving)
         optionsDialog:SetScript("OnDragStop", optionsDialog.StopMovingOrSizing)
-        
         optionsDialog:Hide()
     end
-    
     optionsDialog.editBox:SetText(tostring(ResourceTrackerAccountDB.slotsPerRow))
     optionsDialog:Show()
     optionsDialog.editBox:SetFocus()
 end
 
--- Slot OnEnter handler (created once, reused)
-local function Slot_OnEnter(self)
-    mainFrame.tab:Show()
-    local data = ResourceTrackerAccountDB.slots[self.slotIndex]
-    if data and data.id then
-        GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-        GameTooltip:SetHyperlink("item:" .. data.id)
-        GameTooltip:Show()
+ShowClearAllDialog = function()
+    if not clearAllDialog then
+        clearAllDialog = CreateFrame("Frame", "RTClearAllDialog", UIParent)
+        clearAllDialog:SetSize(300, 140)
+        clearAllDialog:SetPoint("CENTER")
+        clearAllDialog:SetFrameStrata("DIALOG")
+        clearAllDialog:EnableMouse(true)
+        clearAllDialog:SetMovable(true)
+        clearAllDialog:RegisterForDrag("LeftButton")
+        clearAllDialog:SetClampedToScreen(true)
+        clearAllDialog:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = {left = 11, right = 12, top = 12, bottom = 11}
+        })
+        clearAllDialog:SetBackdropColor(0, 0, 0, 0.9)
+        clearAllDialog.title = clearAllDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+        clearAllDialog.title:SetPoint("TOP", 0, -15)
+        clearAllDialog.title:SetText("Clear All Slots?")
+        clearAllDialog.text = clearAllDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        clearAllDialog.text:SetPoint("TOP", clearAllDialog.title, "BOTTOM", 0, -20)
+        clearAllDialog.text:SetWidth(260)
+        clearAllDialog.text:SetJustifyH("CENTER")
+        clearAllDialog.text:SetText("Are you sure you want to clear\nall tracked items?")
+        clearAllDialog.yesButton = CreateFrame("Button", nil, clearAllDialog, "UIPanelButtonTemplate")
+        clearAllDialog.yesButton:SetSize(80, 22)
+        clearAllDialog.yesButton:SetPoint("BOTTOM", -45, 15)
+        clearAllDialog.yesButton:SetText("Yes")
+        clearAllDialog.yesButton:SetScript("OnClick", function()
+            ResourceTrackerAccountDB.slots = {}
+            pollingItems = {}
+            savedCounts = {}
+            RebuildSlots()
+            clearAllDialog:Hide()
+        end)
+        clearAllDialog.noButton = CreateFrame("Button", nil, clearAllDialog, "UIPanelButtonTemplate")
+        clearAllDialog.noButton:SetSize(80, 22)
+        clearAllDialog.noButton:SetPoint("BOTTOM", 45, 15)
+        clearAllDialog.noButton:SetText("No")
+        clearAllDialog.noButton:SetScript("OnClick", function() clearAllDialog:Hide() end)
+        clearAllDialog:SetScript("OnDragStart", clearAllDialog.StartMoving)
+        clearAllDialog:SetScript("OnDragStop", clearAllDialog.StopMovingOrSizing)
+        clearAllDialog:Hide()
     end
+    clearAllDialog:Show()
 end
 
--- Slot OnLeave handler (created once, reused)
-local function Slot_OnLeave(self)
-    GameTooltip:Hide()
-    mainFrame.tabHideTimer = 0.1
-end
-
--- Create a slot button
-local function CreateSlot(parent, index)
+CreateSlot = function(parent, index)
     local slot = CreateFrame("Button", "RTSlot" .. index, parent)
     slot:SetSize(SLOT_SIZE, SLOT_SIZE)
-    slot.slotIndex = index  -- Store index for tooltip handlers
-    
+    slot.slotIndex = index
     slot.icon = slot:CreateTexture(nil, "ARTWORK")
     slot.icon:SetAllPoints()
     slot.icon:SetTexture("Interface\\PaperDoll\\UI-Backpack-EmptySlot")
     slot.icon:SetDesaturated(true)
-    
     slot.plusSign = slot:CreateFontString(nil, "OVERLAY")
     slot.plusSign:SetFont("Fonts\\FRIZQT__.TTF", 24, "OUTLINE")
     slot.plusSign:SetPoint("CENTER", 0, 0)
     slot.plusSign:SetText("+")
     slot.plusSign:SetTextColor(0, 1, 0)
     slot.plusSign:Show()
-    
     slot.count = slot:CreateFontString(nil, "OVERLAY")
     slot.count:SetFont("Fonts\\ARIALN.TTF", 16, "OUTLINE")
     slot.count:SetPoint("BOTTOMRIGHT", -2, 2)
     slot.count:SetTextColor(1, 1, 1)
-    
     slot.goalText = slot:CreateFontString(nil, "OVERLAY")
     slot.goalText:SetFont("Fonts\\FRIZQT__.TTF", 16, "OUTLINE")
     slot.goalText:SetPoint("TOPLEFT", 2, -2)
     slot.goalText:SetTextColor(1, 0.82, 0)
     slot.goalText:Hide()
-    
     slot.checkMark = CreateFrame("Frame", nil, slot)
     slot.checkMark:SetAllPoints()
     slot.checkMark:SetFrameLevel(slot:GetFrameLevel() + 1)
     slot.checkMark:Hide()
-    
     slot.checkMark.texture = slot.checkMark:CreateTexture(nil, "OVERLAY")
     slot.checkMark.texture:SetTexture("Interface\\Buttons\\UI-CheckBox-Check")
     slot.checkMark.texture:SetPoint("CENTER", 0, 0)
     slot.checkMark.texture:SetSize(SLOT_SIZE * 0.95, SLOT_SIZE * 0.95)
     slot.checkMark.texture:SetVertexColor(0, 1, 0, 1.0)
-    
     slot.checkMark.shadow = slot.checkMark:CreateTexture(nil, "ARTWORK")
     slot.checkMark.shadow:SetTexture("Interface\\Buttons\\UI-CheckBox-Check")
     slot.checkMark.shadow:SetPoint("CENTER", 1, -1)
     slot.checkMark.shadow:SetSize(SLOT_SIZE * 0.95, SLOT_SIZE * 0.95)
     slot.checkMark.shadow:SetVertexColor(0, 0, 0, 0.5)
-    
     slot:SetScript("OnClick", function(self, button)
+        if IsControlKeyDown() or IsAltKeyDown() or IsShiftKeyDown() then return end
         if button == "LeftButton" then
             ShowConfigDialog(index)
         elseif button == "RightButton" then
@@ -566,469 +710,319 @@ local function CreateSlot(parent, index)
                 if not dropdownMenu then
                     dropdownMenu = CreateFrame("Frame", "RTDropdownMenu", UIParent, "UIDropDownMenuTemplate")
                 end
-                
                 local menuList = {
-                    {
-                        text = data.goal and "Remove Goal" or "Add Goal",
-                        func = function()
-                            if data.goal then
-                                -- Remove the goal
-                                ResourceTrackerAccountDB.slots[index].goal = nil
-                                UpdateSlot(index)
-                            else
-                                -- Show goal dialog
-                                ShowGoalDialog(index)
-                            end
-                        end,
-                        notCheckable = true
-                    },
-                    {
-                        text = "Clear Slot",
-                        func = function()
-                            local clearedItemId = ResourceTrackerAccountDB.slots[index].id
-                            ResourceTrackerAccountDB.slots[index] = nil
-                            -- Stop polling this item if it was being polled
-                            if clearedItemId then
-                                pollingItems[clearedItemId] = nil
-                            end
-                            -- Must do full rebuild on slot deletion (consolidation needed)
-                            RebuildSlots()
-                        end,
-                        notCheckable = true
-                    },
-                    {
-                        text = "Cancel",
-                        func = function() end,
-                        notCheckable = true
-                    }
+                    {text = data.goal and "Remove Goal" or "Add Goal", func = function()
+                        if data.goal then
+                            ResourceTrackerAccountDB.slots[index].goal = nil
+                            UpdateSlot(index)
+                        else
+                            ShowGoalDialog(index)
+                        end
+                    end, notCheckable = true},
+                    {text = "Clear Slot", func = function()
+                        local clearedItemId = ResourceTrackerAccountDB.slots[index].id
+                        ResourceTrackerAccountDB.slots[index] = nil
+                        if clearedItemId then pollingItems[clearedItemId] = nil end
+                        RebuildSlots()
+                    end, notCheckable = true},
+                    {text = "Clear All Slots", func = function() ShowClearAllDialog() end, notCheckable = true},
+                    {text = "Cancel", func = function() end, notCheckable = true}
                 }
                 EasyMenu(menuList, dropdownMenu, "cursor", 0, 0, "MENU")
             end
         end
     end)
-    
-    slot:RegisterForClicks("LeftButtonUp", "RightButtonUp")
-    
-    -- Set tooltip handlers once (not recreated on rebuild)
-    slot:SetScript("OnEnter", Slot_OnEnter)
-    slot:SetScript("OnLeave", Slot_OnLeave)
-    
+    slot:RegisterForClicks("AnyUp")
+    slot:SetScript("OnEnter", function(self)
+        mainFrame.tab:Show()
+        local data = ResourceTrackerAccountDB.slots[self.slotIndex]
+        if data and data.id then
+            GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+            GameTooltip:SetHyperlink("item:" .. data.id)
+            GameTooltip:Show()
+        end
+    end)
+    slot:SetScript("OnLeave", function(self)
+        GameTooltip:Hide()
+        mainFrame.tabHideTimer = 0.1
+    end)
     return slot
 end
 
--- Lightweight slot repositioning (no count queries)
+UpdateSlot = function(slotIndex)
+    local slot = slots[slotIndex]
+    if not slot then return end
+    local data = ResourceTrackerAccountDB.slots[slotIndex]
+    if not data or not data.id then
+        slot.icon:SetTexture("Interface\\PaperDoll\\UI-Backpack-EmptySlot")
+        slot.icon:SetDesaturated(true)
+        slot.count:SetText("")
+        slot.goalText:Hide()
+        slot.checkMark:Hide()
+        slot.plusSign:Show()
+        return
+    end
+    slot.plusSign:Hide()
+    local itemName, _, _, _, _, _, _, _, _, texture = GetCachedItemInfo(data.id)
+    if not texture then
+        slot.icon:SetTexture("Interface\\PaperDoll\\UI-Backpack-EmptySlot")
+        slot.icon:SetDesaturated(false)
+        slot.count:SetText("...")
+        slot.goalText:Hide()
+        slot.checkMark:Hide()
+        mainFrame.pendingSlots = mainFrame.pendingSlots or {}
+        mainFrame.pendingSlots[slotIndex] = GetTime()
+        return
+    end
+    local count = GetTotalItemCount(data.id)
+    savedCounts[data.id] = count
+    slot.icon:SetTexture(texture)
+    slot.icon:SetDesaturated(false)
+    slot.count:SetText(FormatCount(count))
+    if data.goal then
+        slot.goalText:SetText(FormatCount(data.goal))
+        slot.goalText:Show()
+        slot.checkMark[count >= data.goal and "Show" or "Hide"](slot.checkMark)
+    else
+        slot.goalText:Hide()
+        slot.checkMark:Hide()
+    end
+    if mainFrame.pendingSlots then mainFrame.pendingSlots[slotIndex] = nil end
+end
+
+UpdateAllSlots = function()
+    if not mainFrame then return end
+    for i = 1, #slots do UpdateSlot(i) end
+end
+
 UpdateSlotPositions = function()
     if not mainFrame then return end
-    
-    -- Count filled slots
     local filledCount = 0
     for _, data in pairs(ResourceTrackerAccountDB.slots) do
-        if data and data.id then
-            filledCount = filledCount + 1
-        end
+        if data and data.id then filledCount = filledCount + 1 end
     end
-    
     local totalSlots = filledCount + 1
     local slotsPerRow = ResourceTrackerAccountDB.slotsPerRow or 4
-    
-    -- Hide extra slots if we have too many
-    for i = totalSlots + 1, #slots do
-        slots[i]:Hide()
-    end
-    
-    -- Position and show needed slots
+    for i = totalSlots + 1, #slots do slots[i]:Hide() end
     for i = 1, totalSlots do
-        if not slots[i] then
-            slots[i] = CreateSlot(mainFrame, i)
-        end
-        
+        if not slots[i] then slots[i] = CreateSlot(mainFrame, i) end
         local slot = slots[i]
         slot.slotIndex = i
-        
         local row = math.floor((i - 1) / slotsPerRow)
         local col = (i - 1) % slotsPerRow
-        
         slot:ClearAllPoints()
-        slot:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 
-            col * (SLOT_SIZE + SLOT_SPACING),
-            -(TAB_HEIGHT + row * (SLOT_SIZE + SLOT_SPACING)))
+        slot:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", col * (SLOT_SIZE + SLOT_SPACING), -(TAB_HEIGHT + row * (SLOT_SIZE + SLOT_SPACING)))
         slot:SetParent(mainFrame)
         slot:Show()
     end
-    
-    -- Position tab
     if mainFrame.tab and slots[1] then
         mainFrame.tab:ClearAllPoints()
         mainFrame.tab:SetPoint("BOTTOMLEFT", slots[1], "TOPLEFT", -1, 0)
     end
 end
 
--- Rebuild all slots (full consolidation + count refresh)
 RebuildSlots = function()
     if not mainFrame then return end
-    
-    -- Clean up stale data first
     CleanupStaleData()
-    
-    -- Clear reusable tables
-    for k in pairs(consolidationTemp) do
-        consolidationTemp[k] = nil
-    end
-    for k in pairs(sortedIndicesTemp) do
-        sortedIndicesTemp[k] = nil
-    end
-    
-    -- Consolidate slots (remove gaps)
+    local consolidated = {}
+    local sortedIndices = {}
     for i, data in pairs(ResourceTrackerAccountDB.slots) do
-        if data and data.id then
-            table.insert(sortedIndicesTemp, i)
-        end
+        if data and data.id then table.insert(sortedIndices, i) end
     end
-    table.sort(sortedIndicesTemp)
-    
-    for newIndex, oldIndex in ipairs(sortedIndicesTemp) do
-        consolidationTemp[newIndex] = ResourceTrackerAccountDB.slots[oldIndex]
+    table.sort(sortedIndices)
+    for newIndex, oldIndex in ipairs(sortedIndices) do
+        consolidated[newIndex] = ResourceTrackerAccountDB.slots[oldIndex]
     end
-    
-    ResourceTrackerAccountDB.slots = consolidationTemp
-    -- Create new reference (old one is now saved)
-    consolidationTemp = {}
-    
-    -- Rebuild savedCounts to match current slots
+    ResourceTrackerAccountDB.slots = consolidated
     savedCounts = {}
     for _, data in pairs(ResourceTrackerAccountDB.slots) do
-        if data and data.id then
-            savedCounts[data.id] = GetTotalItemCount(data.id)
-        end
+        if data and data.id then savedCounts[data.id] = GetTotalItemCount(data.id) end
     end
-    
-    -- Reposition slots
     UpdateSlotPositions()
-    
-    -- Update all slot displays
     UpdateAllSlots()
 end
 
--- Save frame position
-local function SaveFramePosition()
-    if not mainFrame then 
-        return 
-    end
-    
-    local left, top = mainFrame:GetLeft(), mainFrame:GetTop()
-    if left and top then
-        ResourceTrackerAccountDB.anchorX = math.floor(left * 100 + 0.5) / 100
-        ResourceTrackerAccountDB.anchorY = math.floor((top - UIParent:GetHeight()) * 100 + 0.5) / 100
-    end
-end
-
--- Load frame position
-local function LoadFramePosition()
-    if not mainFrame then return end
-    
-    mainFrame:ClearAllPoints()
-    local x = type(ResourceTrackerAccountDB.anchorX) == "number" and ResourceTrackerAccountDB.anchorX or 100
-    local y = type(ResourceTrackerAccountDB.anchorY) == "number" and ResourceTrackerAccountDB.anchorY or -200
-    mainFrame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", x, y)
-end
-
--- Delayed position save frame (reused)
-local positionSaveFrame = CreateFrame("Frame")
-positionSaveFrame.delay = 0
-positionSaveFrame.func = nil
-positionSaveFrame:Hide()
-
-positionSaveFrame:SetScript("OnUpdate", function(self, elapsed)
-    if self.delay > 0 then
-        self.delay = self.delay - elapsed
-        if self.delay <= 0 then
-            if self.func then
-                self.func()
-                self.func = nil
-            end
-            self:Hide()
-        end
-    end
-end)
-
-local function SavePositionDelayed(func, delay)
-    positionSaveFrame.func = func
-    positionSaveFrame.delay = delay or 0.1
-    positionSaveFrame:Show()
-end
-
--- Create main frame
 local function CreateMainFrame()
     mainFrame = CreateFrame("Frame", "ResourceTrackerFrame", UIParent)
     mainFrame:SetSize(SLOT_SIZE, TAB_HEIGHT)
-    
-    LoadFramePosition()
-    
+    mainFrame:ClearAllPoints()
+    mainFrame:SetPoint("TOPLEFT", UIParent, "TOPLEFT", ResourceTrackerAccountDB.anchorX, ResourceTrackerAccountDB.anchorY)
     mainFrame:SetMovable(true)
     mainFrame:EnableMouse(true)
     mainFrame:RegisterForDrag("LeftButton")
     mainFrame:SetClampedToScreen(true)
-    
     mainFrame.isLocked = ResourceTrackerAccountDB.isLocked or false
-    
     mainFrame:SetScript("OnDragStop", function()
         mainFrame:StopMovingOrSizing()
-        SaveFramePosition()
+        local left, top = mainFrame:GetLeft(), mainFrame:GetTop()
+        if left and top then
+            ResourceTrackerAccountDB.anchorX = math.floor(left * 100 + 0.5) / 100
+            ResourceTrackerAccountDB.anchorY = math.floor((top - UIParent:GetHeight()) * 100 + 0.5) / 100
+        end
     end)
-    
     slots[1] = CreateSlot(mainFrame, 1)
     slots[1]:SetPoint("TOPLEFT", mainFrame, "TOPLEFT", 0, -TAB_HEIGHT)
-    
     mainFrame.tab = CreateFrame("Frame", nil, mainFrame)
     mainFrame.tab:SetSize(SLOT_SIZE + 2, TAB_HEIGHT)
     mainFrame.tab:SetPoint("BOTTOMLEFT", slots[1], "TOPLEFT", -1, 0)
     mainFrame.tab:Hide()
-    
     mainFrame.tab.bgLeft = mainFrame.tab:CreateTexture(nil, "BACKGROUND")
     mainFrame.tab.bgLeft:SetTexture("Interface\\ChatFrame\\ChatFrameTab-BGLeft")
     mainFrame.tab.bgLeft:SetPoint("LEFT", 0, 0)
     mainFrame.tab.bgLeft:SetSize((SLOT_SIZE + 2) / 3, TAB_HEIGHT)
-    
     mainFrame.tab.bgMid = mainFrame.tab:CreateTexture(nil, "BACKGROUND")
     mainFrame.tab.bgMid:SetTexture("Interface\\ChatFrame\\ChatFrameTab-BGMid")
     mainFrame.tab.bgMid:SetPoint("LEFT", mainFrame.tab.bgLeft, "RIGHT", 0, 0)
     mainFrame.tab.bgMid:SetSize((SLOT_SIZE + 2) / 3, TAB_HEIGHT)
-    
     mainFrame.tab.bgRight = mainFrame.tab:CreateTexture(nil, "BACKGROUND")
     mainFrame.tab.bgRight:SetTexture("Interface\\ChatFrame\\ChatFrameTab-BGRight")
     mainFrame.tab.bgRight:SetPoint("LEFT", mainFrame.tab.bgMid, "RIGHT", 0, 0)
     mainFrame.tab.bgRight:SetSize((SLOT_SIZE + 2) / 3, TAB_HEIGHT)
-    
     mainFrame.tab.text = mainFrame.tab:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     mainFrame.tab.text:SetFont("Fonts\\FRIZQT__.TTF", 9, "OUTLINE")
     mainFrame.tab.text:SetPoint("CENTER", 0, -2)
     mainFrame.tab.text:SetText("Move")
     mainFrame.tab.text:SetTextColor(0.75, 0.61, 0.43)
-    
     mainFrame.tab:EnableMouse(true)
     mainFrame.isDragging = false
-    
-    -- Make tab draggable by propagating to mainFrame
     mainFrame.tab:SetScript("OnMouseDown", function(self, button)
         if button == "LeftButton" and not mainFrame.isLocked then
             mainFrame.isDragging = true
             mainFrame:StartMoving()
         end
     end)
-    
     mainFrame.tab:SetScript("OnMouseUp", function(self, button)
         if button == "LeftButton" and mainFrame.isDragging then
             mainFrame.isDragging = false
             mainFrame:StopMovingOrSizing()
-            SaveFramePosition()
+            local left, top = mainFrame:GetLeft(), mainFrame:GetTop()
+            if left and top then
+                ResourceTrackerAccountDB.anchorX = math.floor(left * 100 + 0.5) / 100
+                ResourceTrackerAccountDB.anchorY = math.floor((top - UIParent:GetHeight()) * 100 + 0.5) / 100
+            end
         elseif button == "RightButton" then
             if not dropdownMenu then
                 dropdownMenu = CreateFrame("Frame", "RTDropdownMenu", UIParent, "UIDropDownMenuTemplate")
             end
-            
             local menuList = {
-                {
-                    text = mainFrame.isLocked and "Unlock Bar" or "Lock Bar",
-                    func = function()
-                        mainFrame.isLocked = not mainFrame.isLocked
-                        ResourceTrackerAccountDB.isLocked = mainFrame.isLocked
-                    end,
-                    notCheckable = true
-                },
-                {
-                    text = "Options",
-                    func = function()
-                        ShowOptionsDialog()
-                    end,
-                    notCheckable = true
-                },
-                {
-                    text = "Cancel",
-                    func = function() end,
-                    notCheckable = true
-                }
+                {text = mainFrame.isLocked and "Unlock Bar" or "Lock Bar", func = function()
+                    mainFrame.isLocked = not mainFrame.isLocked
+                    ResourceTrackerAccountDB.isLocked = mainFrame.isLocked
+                end, notCheckable = true},
+                {text = "Options", func = function() ShowOptionsDialog() end, notCheckable = true},
+                {text = "Cancel", func = function() end, notCheckable = true}
             }
             EasyMenu(menuList, dropdownMenu, "cursor", 0, 0, "MENU")
         end
     end)
-    
-    mainFrame.tab:SetScript("OnLeave", function(self)
-        mainFrame.tabHideTimer = 0.1
-    end)
-    
+    mainFrame.tab:SetScript("OnLeave", function(self) mainFrame.tabHideTimer = 0.1 end)
     mainFrame.tabHideTimer = 0
     mainFrame:SetScript("OnUpdate", function(self, elapsed)
         if self.tabHideTimer > 0 then
             self.tabHideTimer = self.tabHideTimer - elapsed
             if self.tabHideTimer <= 0 then
                 self.tabHideTimer = 0
-                if not self.isDragging then
-                    if not self.tab:IsMouseOver() then
-                        local mouseOverSlot = false
-                        for j = 1, #slots do
-                            if slots[j]:IsShown() and slots[j]:IsMouseOver() then
-                                mouseOverSlot = true
-                                break
-                            end
-                        end
-                        if not mouseOverSlot then
-                            self.tab:Hide()
+                if not self.isDragging and not self.tab:IsMouseOver() then
+                    local mouseOverSlot = false
+                    for j = 1, #slots do
+                        if slots[j]:IsShown() and slots[j]:IsMouseOver() then
+                            mouseOverSlot = true
+                            break
                         end
                     end
+                    if not mouseOverSlot then self.tab:Hide() end
                 end
             end
         end
-        
-        -- Handle pending slots with timeout
         if self.pendingSlots then
             local currentTime = GetTime()
             for slotIndex, startTime in pairs(self.pendingSlots) do
                 if currentTime - startTime > PENDING_TIMEOUT then
-                    -- Timeout reached, stop retrying
                     self.pendingSlots[slotIndex] = nil
                 else
-                    -- Try to update again
                     UpdateSlot(slotIndex)
                 end
             end
         end
     end)
-    
     return mainFrame
 end
 
--- Polling system for waiting on server updates
-pollingItems = {}
 local pollingFrame = CreateFrame("Frame")
 pollingFrame:Hide()
 pollingFrame:SetScript("OnUpdate", function(self, elapsed)
-    local currentTime = GetTime()
-    
     for itemId, pollData in pairs(pollingItems) do
         pollData.timer = pollData.timer + elapsed
         pollData.totalTime = pollData.totalTime + elapsed
-        
-        -- Stop polling after timeout
         if pollData.totalTime >= POLLING_TIMEOUT then
             pollingItems[itemId] = nil
         elseif pollData.timer >= POLLING_INTERVAL then
             pollData.timer = 0
             local currentCount = GetTotalItemCount(itemId)
-            
             if currentCount ~= pollData.oldCount then
-                -- Value changed! Update only this item's slot and stop polling
                 savedCounts[itemId] = currentCount
-                
-                -- Find and update the slot for this item
                 for slotIndex, data in pairs(ResourceTrackerAccountDB.slots) do
                     if data and data.id == itemId then
                         UpdateSlot(slotIndex)
                         break
                     end
                 end
-                
                 pollingItems[itemId] = nil
             end
         end
     end
-    
-    -- Hide frame if no more items to poll
     local hasItems = false
-    for _ in pairs(pollingItems) do
-        hasItems = true
-        break
-    end
-    if not hasItems then
-        self:Hide()
-    end
+    for _ in pairs(pollingItems) do hasItems = true break end
+    if not hasItems then self:Hide() end
 end)
 
--- Event handler
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("CHAT_MSG_LOOT")
 eventFrame:RegisterEvent("PLAYER_LOGOUT")
+eventFrame:RegisterEvent("TRADE_SKILL_SHOW")
+eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
-        -- Cache resource bank API availability (checked once)
         hasResourceBankAPI = (GetCustomGameData ~= nil)
-        
-        if not ResourceTrackerAccountDB.slotsPerRow then
-            ResourceTrackerAccountDB.slotsPerRow = 4
-        end
-        if not ResourceTrackerAccountDB.slots then
-            ResourceTrackerAccountDB.slots = {}
-        end
-        
-        if not ResourceTrackerAccountDB.anchorX then
-            ResourceTrackerAccountDB.anchorX = 100
-            ResourceTrackerAccountDB.anchorY = -200
-        end
-        
         CreateMainFrame()
         RebuildSlots()
-        
-        SavePositionDelayed(function()
-            LoadFramePosition()
-        end, 0.5)
-        
     elseif event == "PLAYER_ENTERING_WORLD" then
-        -- CRITICAL FIX: Only trigger on first login/reload, not zone changes
         if not hasLoadedOnce then
             hasLoadedOnce = true
-            
-            -- Condition #1: Player logging in - update all slots and save counts
-            -- Delay to let resource bank API become ready
-            SavePositionDelayed(function()
-                LoadFramePosition()
-                -- Update all tracked items and save their counts
-                UpdateAllSlots()
-            end, 1.0)
+            C_Timer.After(1.0, UpdateAllSlots)
+            C_Timer.After(2.5, CheckRecipeDataAndPrompt)
         end
-        
     elseif event == "CHAT_MSG_LOOT" then
-        -- Condition #3: Loot message - OPTIMIZED with item ID extraction
-        local lootText = arg1
-        
-        -- Extract item ID from loot link (faster and locale-safe)
-        local lootedItemId = tonumber(lootText:match("item:(%d+)"))
-        
+        local lootedItemId = tonumber(arg1:match("item:(%d+)"))
         if lootedItemId then
-            -- Check if this item is tracked
             for slotIndex, data in pairs(ResourceTrackerAccountDB.slots) do
                 if data and data.id == lootedItemId then
-                    -- Found a match! Check if value updated yet
                     local currentCount = GetTotalItemCount(lootedItemId)
                     local oldCount = savedCounts[lootedItemId] or 0
-                    
                     if currentCount ~= oldCount then
-                        -- Value already changed, update and save
                         savedCounts[lootedItemId] = currentCount
                         UpdateSlot(slotIndex)
                     else
-                        -- Value hasn't changed yet, start polling
                         if not pollingItems[lootedItemId] then
-                            pollingItems[lootedItemId] = {
-                                slotIndex = slotIndex,
-                                oldCount = oldCount,
-                                timer = 0,
-                                totalTime = 0
-                            }
+                            pollingItems[lootedItemId] = {slotIndex = slotIndex, oldCount = oldCount, timer = 0, totalTime = 0}
                             pollingFrame:Show()
                         end
                     end
-                    
-                    -- Only update the specific slot that was looted
                     break
                 end
             end
         end
-        
-    elseif event == "PLAYER_LOGOUT" then
-        SaveFramePosition()
+    elseif event == "TRADE_SKILL_SHOW" then
+        local professionName = GetTradeSkillLine()
+        if professionName then ScanTradeSkillRecipes(professionName) end
+    elseif event == "CHAT_MSG_SYSTEM" then
+        if arg1 and arg1:find("^You have learned how to create a new item:") then
+            C_Timer.After(0.5, CheckRecipeDataAndPrompt)
+        end
     end
 end)
 
-print("|cff00ff00ResourceTracker loaded! Drag the frame to move it.|r")
+print("|cff00ff00ResourceTracker loaded!|r")
