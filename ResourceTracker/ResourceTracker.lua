@@ -1166,16 +1166,22 @@ SetItemRef = function(link, text, button)
     return originalSetItemRef(link, text, button)
 end
 
-hooksecurefunc("HandleModifiedItemClick", function(link)
-    if IsControlKeyDown() and link then
-        local itemId = GetItemIdFromLink(link)
-        if itemId then
-            addQueue = {}
-            QueueItemAdd(itemId, nil, nil)
+local function OnContainerFrameItemClick(button, mouseButton)
+    if IsControlKeyDown() and mouseButton == "RightButton" then
+        local bag = button:GetParent():GetID()
+        local slot = button:GetID()
+        local link = GetContainerItemLink(bag, slot)
+        if link then
+            local itemId = GetItemIdFromLink(link)
+            if itemId then
+                addQueue = {}
+                QueueItemAdd(itemId, nil, nil)
+            end
         end
     end
-end)
+end
 
+hooksecurefunc("ContainerFrameItemButton_OnModifiedClick", OnContainerFrameItemClick)
 
 local function HookAtlasLootButtons()
     if not AtlasLoot or not AtlasLoot.ItemFrame then return end
@@ -1190,6 +1196,9 @@ local function HookAtlasLootButtons()
                         addQueue = {}
                         QueueItemAdd(itemId, nil, nil)
                     end
+                    return
+                elseif IsControlKeyDown() and mouseButton == "LeftButton" then
+                    return
                 end
             end)
             button.RTHooked = true
