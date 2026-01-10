@@ -8,17 +8,20 @@ ResourceTrackerAccountDB = ResourceTrackerAccountDB or {
     slots = {},
     isLocked = false,
     slotsPerRow = 4,
-    knownRecipes = {}
+    knownRecipes = {},
+    needsRecipeRefresh = false
 }
 
+if not ResourceTrackerAccountDB.knownRecipes then ResourceTrackerAccountDB.knownRecipes = {} end
+if type(ResourceTrackerAccountDB.needsRecipeRefresh) ~= "boolean" then ResourceTrackerAccountDB.needsRecipeRefresh = false end
 if not ResourceTrackerAccountDB.anchorX then ResourceTrackerAccountDB.anchorX = 100 end
 if not ResourceTrackerAccountDB.anchorY then ResourceTrackerAccountDB.anchorY = -200 end
 if not ResourceTrackerAccountDB.slots then ResourceTrackerAccountDB.slots = {} end
 if type(ResourceTrackerAccountDB.isLocked) ~= "boolean" then ResourceTrackerAccountDB.isLocked = false end
 if not ResourceTrackerAccountDB.slotsPerRow then ResourceTrackerAccountDB.slotsPerRow = 4 end
-if not ResourceTrackerAccountDB.knownRecipes then ResourceTrackerAccountDB.knownRecipes = {} end
 
-local mainFrame, dropdownMenu, configDialog, goalDialog, optionsDialog, reagentDialog, recipePromptDialog, clearAllDialog
+
+local mainFrame, dropdownMenu, configDialog, goalDialog, optionsDialog, reagentDialog, recipePromptDialog, newRecipeDialog, clearAllDialog
 local slots = {}
 local savedCounts = {}
 local itemCache = {}
@@ -31,6 +34,20 @@ local hasResourceBankAPI = false
 
 local SLOT_SIZE = 37
 local SLOT_SPACING = 4
+local function DelayedCall(func, delay)
+    local frame = CreateFrame("Frame")
+    frame.timer = delay
+    frame.func = func
+    frame:SetScript("OnUpdate", function(self, elapsed)
+        self.timer = self.timer - elapsed
+        if self.timer <= 0 then
+            self:SetScript("OnUpdate", nil)
+            if self.func then self.func() end
+            self.func = nil
+            self:Hide()
+        end
+    end)
+end
 local TAB_HEIGHT = 24
 local PENDING_TIMEOUT = 10
 local POLLING_TIMEOUT = 10
@@ -135,6 +152,7 @@ local function ScanTradeSkillRecipes(professionName)
         end
     end
     ResourceTrackerAccountDB.knownRecipes[professionName] = recipesData
+    ResourceTrackerAccountDB.needsRecipeRefresh = false
 end
 
 local function GetMissingProfessions()
@@ -435,7 +453,7 @@ end
 local function ShowConfigDialog(slotIndex)
     if not configDialog then
         configDialog = CreateFrame("Frame", "RTConfigDialog", UIParent)
-        configDialog:SetSize(280, 130)
+        configDialog:SetSize(280, 170)
         configDialog:SetPoint("CENTER")
         configDialog:SetFrameStrata("DIALOG")
         configDialog:EnableMouse(true)
@@ -449,12 +467,22 @@ local function ShowConfigDialog(slotIndex)
             insets = {left = 11, right = 12, top = 12, bottom = 11}
         })
         configDialog:SetBackdropColor(0, 0, 0, 0.9)
-        configDialog.title = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-        configDialog.title:SetPoint("TOP", 0, -15)
+        
+        configDialog.title = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        configDialog.title:SetPoint("TOP", 0, -20)
         configDialog.title:SetText("Enter Item ID")
+        
+        configDialog.orText = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        configDialog.orText:SetPoint("TOP", configDialog.title, "BOTTOM", 0, -8)
+        configDialog.orText:SetText("or")
+        
+        configDialog.ctrlText = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        configDialog.ctrlText:SetPoint("TOP", configDialog.orText, "BOTTOM", 0, -8)
+        configDialog.ctrlText:SetText("Ctrl+Right Click an Item")
+        
         configDialog.editBox = CreateFrame("EditBox", nil, configDialog, "InputBoxTemplate")
         configDialog.editBox:SetSize(200, 20)
-        configDialog.editBox:SetPoint("TOP", configDialog.title, "BOTTOM", 0, -20)
+        configDialog.editBox:SetPoint("TOP", configDialog.ctrlText, "BOTTOM", 0, -15)
         configDialog.editBox:SetAutoFocus(false)
         configDialog.editBox:SetMaxLetters(10)
         configDialog.editBox:SetNumeric(true)
@@ -497,7 +525,6 @@ local function ShowConfigDialog(slotIndex)
     configDialog:Show()
     configDialog.editBox:SetFocus()
 end
-
 ShowGoalDialog = function(slotIndex)
     if not goalDialog then
         goalDialog = CreateFrame("Frame", "RTGoalDialog", UIParent)
@@ -1016,11 +1043,50 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         CreateMainFrame()
         RebuildSlots()
     elseif event == "PLAYER_ENTERING_WORLD" then
-        if not hasLoadedOnce then
-            hasLoadedOnce = true
-            C_Timer.After(1.0, UpdateAllSlots)
-            C_Timer.After(2.5, CheckRecipeDataAndPrompt)
-        end
+    if not hasLoadedOnce then
+        hasLoadedOnce = true
+        DelayedCall(UpdateAllSlots, 1.0)
+        DelayedCall(function()
+            if ResourceTrackerAccountDB.needsRecipeRefresh then
+                if not newRecipeDialog then
+                    newRecipeDialog = CreateFrame("Frame", "RTNewRecipeDialog", UIParent)
+                    newRecipeDialog:SetSize(360, 150)
+                    newRecipeDialog:SetPoint("CENTER")
+                    newRecipeDialog:SetFrameStrata("DIALOG")
+                    newRecipeDialog:EnableMouse(true)
+                    newRecipeDialog:SetMovable(true)
+                    newRecipeDialog:RegisterForDrag("LeftButton")
+                    newRecipeDialog:SetClampedToScreen(true)
+                    newRecipeDialog:SetBackdrop({
+                        bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+                        edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+                        tile = true, tileSize = 32, edgeSize = 32,
+                        insets = {left = 11, right = 12, top = 12, bottom = 11}
+                    })
+                    newRecipeDialog:SetBackdropColor(0, 0, 0, 0.9)
+                    newRecipeDialog.title = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                    newRecipeDialog.title:SetPoint("TOP", 0, -15)
+                    newRecipeDialog.title:SetText("New Recipe Learned")
+                    newRecipeDialog.text = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+                    newRecipeDialog.text:SetPoint("TOP", newRecipeDialog.title, "BOTTOM", 0, -20)
+                    newRecipeDialog.text:SetWidth(320)
+                    newRecipeDialog.text:SetJustifyH("CENTER")
+                    newRecipeDialog.text:SetText("Please open your profession window\nto cache the new recipe.")
+                    newRecipeDialog.okButton = CreateFrame("Button", nil, newRecipeDialog, "UIPanelButtonTemplate")
+                    newRecipeDialog.okButton:SetSize(80, 22)
+                    newRecipeDialog.okButton:SetPoint("BOTTOM", 0, 15)
+                    newRecipeDialog.okButton:SetText("OK")
+                    newRecipeDialog.okButton:SetScript("OnClick", function() newRecipeDialog:Hide() end)
+                    newRecipeDialog:SetScript("OnDragStart", newRecipeDialog.StartMoving)
+                    newRecipeDialog:SetScript("OnDragStop", newRecipeDialog.StopMovingOrSizing)
+                    newRecipeDialog:Hide()
+                end
+                newRecipeDialog:Show()
+            else
+                CheckRecipeDataAndPrompt()
+            end
+        end, 2.5)
+    end
     elseif event == "CHAT_MSG_LOOT" then
         local lootedItemId = tonumber(arg1:match("item:(%d+)"))
         if lootedItemId then
@@ -1045,9 +1111,104 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         local professionName = GetTradeSkillLine()
         if professionName then ScanTradeSkillRecipes(professionName) end
     elseif event == "CHAT_MSG_SYSTEM" then
-        if arg1 and arg1:find("^You have learned how to create a new item:") then
-            C_Timer.After(0.5, CheckRecipeDataAndPrompt)
+    if arg1 and arg1:find("^You have learned how to create a new item:") then
+        ResourceTrackerAccountDB.needsRecipeRefresh = true
+        DelayedCall(function()
+            if not newRecipeDialog then
+                newRecipeDialog = CreateFrame("Frame", "RTNewRecipeDialog", UIParent)
+                newRecipeDialog:SetSize(360, 150)
+                newRecipeDialog:SetPoint("CENTER")
+                newRecipeDialog:SetFrameStrata("DIALOG")
+                newRecipeDialog:EnableMouse(true)
+                newRecipeDialog:SetMovable(true)
+                newRecipeDialog:RegisterForDrag("LeftButton")
+                newRecipeDialog:SetClampedToScreen(true)
+                newRecipeDialog:SetBackdrop({
+                    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+                    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+                    tile = true, tileSize = 32, edgeSize = 32,
+                    insets = {left = 11, right = 12, top = 12, bottom = 11}
+                })
+                newRecipeDialog:SetBackdropColor(0, 0, 0, 0.9)
+                newRecipeDialog.title = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                newRecipeDialog.title:SetPoint("TOP", 0, -15)
+                newRecipeDialog.title:SetText("New Recipe Learned")
+                newRecipeDialog.text = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+                newRecipeDialog.text:SetPoint("TOP", newRecipeDialog.title, "BOTTOM", 0, -20)
+                newRecipeDialog.text:SetWidth(320)
+                newRecipeDialog.text:SetJustifyH("CENTER")
+                newRecipeDialog.text:SetText("Please open your profession window\nto cache the new recipe.")
+                newRecipeDialog.okButton = CreateFrame("Button", nil, newRecipeDialog, "UIPanelButtonTemplate")
+                newRecipeDialog.okButton:SetSize(80, 22)
+                newRecipeDialog.okButton:SetPoint("BOTTOM", 0, 15)
+                newRecipeDialog.okButton:SetText("OK")
+                newRecipeDialog.okButton:SetScript("OnClick", function() newRecipeDialog:Hide() end)
+                newRecipeDialog:SetScript("OnDragStart", newRecipeDialog.StartMoving)
+                newRecipeDialog:SetScript("OnDragStop", newRecipeDialog.StopMovingOrSizing)
+                newRecipeDialog:Hide()
+            end
+            newRecipeDialog:Show()
+        end, 0.5)
+    end
+end
+end)
+
+local originalSetItemRef = SetItemRef
+SetItemRef = function(link, text, button)
+    if IsControlKeyDown() and button == "RightButton" and link and link:find("^item:") then
+        local itemId = GetItemIdFromLink(link)
+        if itemId then
+            addQueue = {}
+            QueueItemAdd(itemId, nil, nil)
+            return
         end
+    end
+    return originalSetItemRef(link, text, button)
+end
+
+hooksecurefunc("HandleModifiedItemClick", function(link)
+    if IsControlKeyDown() and link then
+        local itemId = GetItemIdFromLink(link)
+        if itemId then
+            addQueue = {}
+            QueueItemAdd(itemId, nil, nil)
+        end
+    end
+end)
+
+
+local function HookAtlasLootButtons()
+    if not AtlasLoot or not AtlasLoot.ItemFrame then return end
+    
+    for i = 1, 30 do
+        local button = _G["AtlasLootItem_"..i]
+        if button and not button.RTHooked then
+            button:HookScript("OnClick", function(self, mouseButton)
+                if IsControlKeyDown() and mouseButton == "RightButton" and self.par and self.par.info and self.par.info[2] then
+                    local itemId = self.par.info[2]
+                    if itemId and type(itemId) == "number" and itemId > 0 then
+                        addQueue = {}
+                        QueueItemAdd(itemId, nil, nil)
+                    end
+                end
+            end)
+            button.RTHooked = true
+        end
+    end
+end
+
+local atlasLootFrame = CreateFrame("Frame")
+atlasLootFrame:RegisterEvent("ADDON_LOADED")
+atlasLootFrame:SetScript("OnEvent", function(self, event, arg1)
+    if arg1 == "AtlasLoot" then
+        DelayedCall(function()
+            HookAtlasLootButtons()
+            if AtlasLoot and AtlasLoot.ShowLootPage then
+                hooksecurefunc(AtlasLoot, "ShowLootPage", HookAtlasLootButtons)
+            end
+        end, 0.5)
+        self:UnregisterAllEvents()
+        self:SetScript("OnEvent", nil)
     end
 end)
 
