@@ -1153,35 +1153,67 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
 end
 end)
 
-local originalSetItemRef = SetItemRef
-SetItemRef = function(link, text, button)
-    if IsControlKeyDown() and button == "RightButton" and link and link:find("^item:") then
-        local itemId = GetItemIdFromLink(link)
-        if itemId then
-            addQueue = {}
-            QueueItemAdd(itemId, nil, nil)
-            return
-        end
-    end
-    return originalSetItemRef(link, text, button)
-end
+local lastItemId = nil
+local lastClickTime = 0
+local isRightButtonDown = false
 
-local function OnContainerFrameItemClick(button, mouseButton)
-    if IsControlKeyDown() and mouseButton == "RightButton" then
-        local bag = button:GetParent():GetID()
-        local slot = button:GetID()
-        local link = GetContainerItemLink(bag, slot)
-        if link then
-            local itemId = GetItemIdFromLink(link)
-            if itemId then
-                addQueue = {}
-                QueueItemAdd(itemId, nil, nil)
+GameTooltip:HookScript("OnTooltipSetItem", function(self)
+    local _, itemLink = self:GetItem()
+    if itemLink then
+        lastItemId = GetItemIdFromLink(itemLink)
+    else
+        lastItemId = nil
+    end
+end)
+
+GameTooltip:HookScript("OnHide", function(self)
+    lastItemId = nil
+end)
+
+local function HookAtlasLootTooltip()
+    if AtlasLootTooltip and not AtlasLootTooltip.RTHooked then
+        AtlasLootTooltip:HookScript("OnTooltipSetItem", function(self)
+            local _, itemLink = self:GetItem()
+            if itemLink then
+                lastItemId = GetItemIdFromLink(itemLink)
+            else
+                lastItemId = nil
             end
-        end
+        end)
+        
+        AtlasLootTooltip:HookScript("OnHide", function(self)
+            lastItemId = nil
+        end)
+        
+        AtlasLootTooltip.RTHooked = true
     end
 end
 
-hooksecurefunc("ContainerFrameItemButton_OnModifiedClick", OnContainerFrameItemClick)
+local atlasLootDetector = CreateFrame("Frame")
+atlasLootDetector:RegisterEvent("ADDON_LOADED")
+atlasLootDetector:SetScript("OnEvent", function(self, event, addon)
+    if addon == "AtlasLoot" then
+        DelayedCall(HookAtlasLootTooltip, 0.5)
+        self:UnregisterAllEvents()
+    end
+end)
+
+local clickDetector = CreateFrame("Frame")
+clickDetector:SetScript("OnUpdate", function(self, elapsed)
+    local rightButtonNow = IsMouseButtonDown("RightButton")
+    
+    if IsControlKeyDown() and rightButtonNow and not isRightButtonDown then
+        isRightButtonDown = true
+        local currentTime = GetTime()
+        if lastItemId and (currentTime - lastClickTime) > 0.3 then
+            lastClickTime = currentTime
+            addQueue = {}
+            QueueItemAdd(lastItemId, nil, nil)
+        end
+    elseif not rightButtonNow then
+        isRightButtonDown = false
+    end
+end)
 
 local function HookAtlasLootButtons()
     if not AtlasLoot or not AtlasLoot.ItemFrame then return end
@@ -1206,9 +1238,9 @@ local function HookAtlasLootButtons()
     end
 end
 
-local atlasLootFrame = CreateFrame("Frame")
-atlasLootFrame:RegisterEvent("ADDON_LOADED")
-atlasLootFrame:SetScript("OnEvent", function(self, event, arg1)
+local atlasLootButtonHook = CreateFrame("Frame")
+atlasLootButtonHook:RegisterEvent("ADDON_LOADED")
+atlasLootButtonHook:SetScript("OnEvent", function(self, event, arg1)
     if arg1 == "AtlasLoot" then
         DelayedCall(function()
             HookAtlasLootButtons()
