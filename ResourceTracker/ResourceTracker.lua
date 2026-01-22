@@ -20,38 +20,24 @@ if not ResourceTrackerAccountDB.slots then ResourceTrackerAccountDB.slots = {} e
 if type(ResourceTrackerAccountDB.isLocked) ~= "boolean" then ResourceTrackerAccountDB.isLocked = false end
 if not ResourceTrackerAccountDB.slotsPerRow then ResourceTrackerAccountDB.slotsPerRow = 4 end
 
-
 local mainFrame, dropdownMenu, configDialog, goalDialog, optionsDialog, reagentDialog, recipePromptDialog, newRecipeDialog, clearAllDialog
 local slots = {}
 local savedCounts = {}
 local itemCache = {}
-local pollingItems = {}
 local addQueue = {}
 local isProcessingQueue = false
 local currentQueueItem = nil
 local hasLoadedOnce = false
 local hasResourceBankAPI = false
+local retryTimer = nil
+local retryCount = 0
 
 local SLOT_SIZE = 37
 local SLOT_SPACING = 4
-local function DelayedCall(func, delay)
-    local frame = CreateFrame("Frame")
-    frame.timer = delay
-    frame.func = func
-    frame:SetScript("OnUpdate", function(self, elapsed)
-        self.timer = self.timer - elapsed
-        if self.timer <= 0 then
-            self:SetScript("OnUpdate", nil)
-            if self.func then self.func() end
-            self.func = nil
-            self:Hide()
-        end
-    end)
-end
 local TAB_HEIGHT = 24
 local PENDING_TIMEOUT = 10
-local POLLING_TIMEOUT = 10
-local POLLING_INTERVAL = 1.0
+local MAX_RETRIES = 10
+local RETRY_DELAY = 1.0
 
 local PROFESSIONS = {
     "Alchemy", "Blacksmithing", "Enchanting", "Engineering",
@@ -83,6 +69,21 @@ local ELEMENTAL_CONVERSIONS = {
     [22456] = {component = 22577, count = 10},
     [22457] = {component = 22576, count = 10}
 }
+
+local function DelayedCall(func, delay)
+    local frame = CreateFrame("Frame")
+    frame.timer = delay
+    frame.func = func
+    frame:SetScript("OnUpdate", function(self, elapsed)
+        self.timer = self.timer - elapsed
+        if self.timer <= 0 then
+            self:SetScript("OnUpdate", nil)
+            if self.func then self.func() end
+            self.func = nil
+            self:Hide()
+        end
+    end)
+end
 
 local function FormatCount(count)
     if count >= 1000000 then
@@ -237,7 +238,6 @@ local function CleanupStaleData()
         end
         if not isTracked then
             savedCounts[itemId] = nil
-            pollingItems[itemId] = nil
         end
     end
 end
@@ -467,19 +467,15 @@ local function ShowConfigDialog(slotIndex)
             insets = {left = 11, right = 12, top = 12, bottom = 11}
         })
         configDialog:SetBackdropColor(0, 0, 0, 0.9)
-        
         configDialog.title = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         configDialog.title:SetPoint("TOP", 0, -20)
         configDialog.title:SetText("Enter Item ID")
-        
         configDialog.orText = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         configDialog.orText:SetPoint("TOP", configDialog.title, "BOTTOM", 0, -8)
         configDialog.orText:SetText("or")
-        
         configDialog.ctrlText = configDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
         configDialog.ctrlText:SetPoint("TOP", configDialog.orText, "BOTTOM", 0, -8)
         configDialog.ctrlText:SetText("Ctrl+Right Click an Item")
-        
         configDialog.editBox = CreateFrame("EditBox", nil, configDialog, "InputBoxTemplate")
         configDialog.editBox:SetSize(200, 20)
         configDialog.editBox:SetPoint("TOP", configDialog.ctrlText, "BOTTOM", 0, -15)
@@ -525,6 +521,7 @@ local function ShowConfigDialog(slotIndex)
     configDialog:Show()
     configDialog.editBox:SetFocus()
 end
+
 ShowGoalDialog = function(slotIndex)
     if not goalDialog then
         goalDialog = CreateFrame("Frame", "RTGoalDialog", UIParent)
@@ -838,7 +835,37 @@ end
 
 UpdateAllSlots = function()
     if not mainFrame then return end
+    local needsRetry = false
+    for _, data in pairs(ResourceTrackerAccountDB.slots) do
+        if data and data.id then
+            local currentCount = GetTotalItemCount(data.id)
+            local cachedCount = savedCounts[data.id] or 0
+            if currentCount ~= cachedCount then
+                savedCounts[data.id] = currentCount
+            else
+                needsRetry = true
+            end
+        end
+    end
     for i = 1, #slots do UpdateSlot(i) end
+    
+    if needsRetry and retryCount < MAX_RETRIES then
+        if not retryTimer then
+            retryTimer = CreateFrame("Frame")
+        end
+        retryTimer.elapsed = 0
+        retryTimer:SetScript("OnUpdate", function(self, elapsed)
+            self.elapsed = self.elapsed + elapsed
+            if self.elapsed >= RETRY_DELAY then
+                self:SetScript("OnUpdate", nil)
+                retryTimer = nil
+                retryCount = retryCount + 1
+                UpdateAllSlots()
+            end
+        end)
+    else
+        retryCount = 0
+    end
 end
 
 UpdateSlotPositions = function()
@@ -955,6 +982,7 @@ local function CreateMainFrame()
                     mainFrame.isLocked = not mainFrame.isLocked
                     ResourceTrackerAccountDB.isLocked = mainFrame.isLocked
                 end, notCheckable = true},
+                {text = "Refresh Counts", func = function() UpdateAllSlots() end, notCheckable = true},
                 {text = "Options", func = function() ShowOptionsDialog() end, notCheckable = true},
                 {text = "Cancel", func = function() end, notCheckable = true}
             }
@@ -996,39 +1024,17 @@ end
 
 local pollingFrame = CreateFrame("Frame")
 pollingFrame:Hide()
-pollingFrame:SetScript("OnUpdate", function(self, elapsed)
-    for itemId, pollData in pairs(pollingItems) do
-        pollData.timer = pollData.timer + elapsed
-        pollData.totalTime = pollData.totalTime + elapsed
-        if pollData.totalTime >= POLLING_TIMEOUT then
-            pollingItems[itemId] = nil
-        elseif pollData.timer >= POLLING_INTERVAL then
-            pollData.timer = 0
-            local currentCount = GetTotalItemCount(itemId)
-            if currentCount ~= pollData.oldCount then
-                savedCounts[itemId] = currentCount
-                for slotIndex, data in pairs(ResourceTrackerAccountDB.slots) do
-                    if data and data.id == itemId then
-                        UpdateSlot(slotIndex)
-                        break
-                    end
-                end
-                pollingItems[itemId] = nil
-            end
-        end
-    end
-    local hasItems = false
-    for _ in pairs(pollingItems) do hasItems = true break end
-    if not hasItems then self:Hide() end
-end)
 
 local eventFrame = CreateFrame("Frame")
 eventFrame:RegisterEvent("ADDON_LOADED")
 eventFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
 eventFrame:RegisterEvent("CHAT_MSG_LOOT")
+eventFrame:RegisterEvent("BAG_UPDATE")
 eventFrame:RegisterEvent("PLAYER_LOGOUT")
 eventFrame:RegisterEvent("TRADE_SKILL_SHOW")
 eventFrame:RegisterEvent("CHAT_MSG_SYSTEM")
+eventFrame:RegisterEvent("QUEST_TURNED_IN")
+eventFrame:RegisterEvent("MERCHANT_CLOSED")
 
 eventFrame:SetScript("OnEvent", function(self, event, arg1)
     if event == "ADDON_LOADED" and arg1 == addonName then
@@ -1043,11 +1049,77 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
         CreateMainFrame()
         RebuildSlots()
     elseif event == "PLAYER_ENTERING_WORLD" then
-    if not hasLoadedOnce then
-        hasLoadedOnce = true
-        DelayedCall(UpdateAllSlots, 1.0)
-        DelayedCall(function()
-            if ResourceTrackerAccountDB.needsRecipeRefresh then
+        if not hasLoadedOnce then
+            hasLoadedOnce = true
+            DelayedCall(UpdateAllSlots, 1.0)
+            DelayedCall(function()
+                if ResourceTrackerAccountDB.needsRecipeRefresh then
+                    if not newRecipeDialog then
+                        newRecipeDialog = CreateFrame("Frame", "RTNewRecipeDialog", UIParent)
+                        newRecipeDialog:SetSize(360, 150)
+                        newRecipeDialog:SetPoint("CENTER")
+                        newRecipeDialog:SetFrameStrata("DIALOG")
+                        newRecipeDialog:EnableMouse(true)
+                        newRecipeDialog:SetMovable(true)
+                        newRecipeDialog:RegisterForDrag("LeftButton")
+                        newRecipeDialog:SetClampedToScreen(true)
+                        newRecipeDialog:SetBackdrop({
+                            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+                            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+                            tile = true, tileSize = 32, edgeSize = 32,
+                            insets = {left = 11, right = 12, top = 12, bottom = 11}
+                        })
+                        newRecipeDialog:SetBackdropColor(0, 0, 0, 0.9)
+                        newRecipeDialog.title = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+                        newRecipeDialog.title:SetPoint("TOP", 0, -15)
+                        newRecipeDialog.title:SetText("New Recipe Learned")
+                        newRecipeDialog.text = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+                        newRecipeDialog.text:SetPoint("TOP", newRecipeDialog.title, "BOTTOM", 0, -20)
+                        newRecipeDialog.text:SetWidth(320)
+                        newRecipeDialog.text:SetJustifyH("CENTER")
+                        newRecipeDialog.text:SetText("Please open your profession window\nto cache the new recipe.")
+                        newRecipeDialog.okButton = CreateFrame("Button", nil, newRecipeDialog, "UIPanelButtonTemplate")
+                        newRecipeDialog.okButton:SetSize(80, 22)
+                        newRecipeDialog.okButton:SetPoint("BOTTOM", 0, 15)
+                        newRecipeDialog.okButton:SetText("OK")
+                        newRecipeDialog.okButton:SetScript("OnClick", function() newRecipeDialog:Hide() end)
+                        newRecipeDialog:SetScript("OnDragStart", newRecipeDialog.StartMoving)
+                        newRecipeDialog:SetScript("OnDragStop", newRecipeDialog.StopMovingOrSizing)
+                        newRecipeDialog:Hide()
+                    end
+                    newRecipeDialog:Show()
+                else
+                    CheckRecipeDataAndPrompt()
+                end
+            end, 2.5)
+        end
+    elseif event == "CHAT_MSG_LOOT" then
+        local lootedItemId = tonumber(arg1:match("item:(%d+)"))
+        if lootedItemId then
+            local isTracked = false
+            for _, data in pairs(ResourceTrackerAccountDB.slots) do
+                if data and data.id == lootedItemId then
+                    isTracked = true
+                    break
+                end
+            end
+            if isTracked then
+                DelayedCall(UpdateAllSlots, 0.3)
+            end
+        end
+    elseif event == "BAG_UPDATE" then
+        DelayedCall(UpdateAllSlots, 0.3)
+    elseif event == "QUEST_TURNED_IN" then
+        UpdateAllSlots()
+    elseif event == "MERCHANT_CLOSED" then
+        UpdateAllSlots()
+    elseif event == "TRADE_SKILL_SHOW" then
+        local professionName = GetTradeSkillLine()
+        if professionName then ScanTradeSkillRecipes(professionName) end
+    elseif event == "CHAT_MSG_SYSTEM" then
+        if arg1 and arg1:find("^You have learned how to create a new item:") then
+            ResourceTrackerAccountDB.needsRecipeRefresh = true
+            DelayedCall(function()
                 if not newRecipeDialog then
                     newRecipeDialog = CreateFrame("Frame", "RTNewRecipeDialog", UIParent)
                     newRecipeDialog:SetSize(360, 150)
@@ -1082,75 +1154,9 @@ eventFrame:SetScript("OnEvent", function(self, event, arg1)
                     newRecipeDialog:Hide()
                 end
                 newRecipeDialog:Show()
-            else
-                CheckRecipeDataAndPrompt()
-            end
-        end, 2.5)
-    end
-    elseif event == "CHAT_MSG_LOOT" then
-        local lootedItemId = tonumber(arg1:match("item:(%d+)"))
-        if lootedItemId then
-            for slotIndex, data in pairs(ResourceTrackerAccountDB.slots) do
-                if data and data.id == lootedItemId then
-                    local currentCount = GetTotalItemCount(lootedItemId)
-                    local oldCount = savedCounts[lootedItemId] or 0
-                    if currentCount ~= oldCount then
-                        savedCounts[lootedItemId] = currentCount
-                        UpdateSlot(slotIndex)
-                    else
-                        if not pollingItems[lootedItemId] then
-                            pollingItems[lootedItemId] = {slotIndex = slotIndex, oldCount = oldCount, timer = 0, totalTime = 0}
-                            pollingFrame:Show()
-                        end
-                    end
-                    break
-                end
-            end
+            end, 0.5)
         end
-    elseif event == "TRADE_SKILL_SHOW" then
-        local professionName = GetTradeSkillLine()
-        if professionName then ScanTradeSkillRecipes(professionName) end
-    elseif event == "CHAT_MSG_SYSTEM" then
-    if arg1 and arg1:find("^You have learned how to create a new item:") then
-        ResourceTrackerAccountDB.needsRecipeRefresh = true
-        DelayedCall(function()
-            if not newRecipeDialog then
-                newRecipeDialog = CreateFrame("Frame", "RTNewRecipeDialog", UIParent)
-                newRecipeDialog:SetSize(360, 150)
-                newRecipeDialog:SetPoint("CENTER")
-                newRecipeDialog:SetFrameStrata("DIALOG")
-                newRecipeDialog:EnableMouse(true)
-                newRecipeDialog:SetMovable(true)
-                newRecipeDialog:RegisterForDrag("LeftButton")
-                newRecipeDialog:SetClampedToScreen(true)
-                newRecipeDialog:SetBackdrop({
-                    bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
-                    edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-                    tile = true, tileSize = 32, edgeSize = 32,
-                    insets = {left = 11, right = 12, top = 12, bottom = 11}
-                })
-                newRecipeDialog:SetBackdropColor(0, 0, 0, 0.9)
-                newRecipeDialog.title = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
-                newRecipeDialog.title:SetPoint("TOP", 0, -15)
-                newRecipeDialog.title:SetText("New Recipe Learned")
-                newRecipeDialog.text = newRecipeDialog:CreateFontString(nil, "OVERLAY", "GameFontNormal")
-                newRecipeDialog.text:SetPoint("TOP", newRecipeDialog.title, "BOTTOM", 0, -20)
-                newRecipeDialog.text:SetWidth(320)
-                newRecipeDialog.text:SetJustifyH("CENTER")
-                newRecipeDialog.text:SetText("Please open your profession window\nto cache the new recipe.")
-                newRecipeDialog.okButton = CreateFrame("Button", nil, newRecipeDialog, "UIPanelButtonTemplate")
-                newRecipeDialog.okButton:SetSize(80, 22)
-                newRecipeDialog.okButton:SetPoint("BOTTOM", 0, 15)
-                newRecipeDialog.okButton:SetText("OK")
-                newRecipeDialog.okButton:SetScript("OnClick", function() newRecipeDialog:Hide() end)
-                newRecipeDialog:SetScript("OnDragStart", newRecipeDialog.StartMoving)
-                newRecipeDialog:SetScript("OnDragStop", newRecipeDialog.StopMovingOrSizing)
-                newRecipeDialog:Hide()
-            end
-            newRecipeDialog:Show()
-        end, 0.5)
     end
-end
 end)
 
 local lastItemId = nil
@@ -1180,11 +1186,9 @@ local function HookAtlasLootTooltip()
                 lastItemId = nil
             end
         end)
-        
         AtlasLootTooltip:HookScript("OnHide", function(self)
             lastItemId = nil
         end)
-        
         AtlasLootTooltip.RTHooked = true
     end
 end
@@ -1201,7 +1205,6 @@ end)
 local clickDetector = CreateFrame("Frame")
 clickDetector:SetScript("OnUpdate", function(self, elapsed)
     local rightButtonNow = IsMouseButtonDown("RightButton")
-    
     if IsControlKeyDown() and rightButtonNow and not isRightButtonDown then
         isRightButtonDown = true
         local currentTime = GetTime()
@@ -1217,7 +1220,6 @@ end)
 
 local function HookAtlasLootButtons()
     if not AtlasLoot or not AtlasLoot.ItemFrame then return end
-    
     for i = 1, 30 do
         local button = _G["AtlasLootItem_"..i]
         if button and not button.RTHooked then
