@@ -678,7 +678,6 @@ ShowClearAllDialog = function()
         clearAllDialog.yesButton:SetText("Yes")
         clearAllDialog.yesButton:SetScript("OnClick", function()
             ResourceTrackerAccountDB.slots = {}
-            pollingItems = {}
             savedCounts = {}
             RebuildSlots()
             clearAllDialog:Hide()
@@ -763,9 +762,7 @@ CreateSlot = function(parent, index)
                         end
                     end, notCheckable = true},
                     {text = "Clear Slot", func = function()
-                        local clearedItemId = ResourceTrackerAccountDB.slots[index].id
                         ResourceTrackerAccountDB.slots[index] = nil
-                        if clearedItemId then pollingItems[clearedItemId] = nil end
                         RebuildSlots()
                     end, notCheckable = true},
                     {text = "Clear All Slots", func = function() ShowClearAllDialog() end, notCheckable = true},
